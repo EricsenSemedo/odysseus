@@ -362,6 +362,12 @@ def comprehensive_web_search(
     output_parts.append("=" * 70)
     output_parts.append("WEB SEARCH RESULTS AND FETCHED CONTENT")
     output_parts.append(f"Query: {query}")
+    now = datetime.now().astimezone()
+    output_parts.append(f"Search generated at: {now:%Y-%m-%d %H:%M:%S %Z}")
+    output_parts.append(f"Current calendar date: {now:%Y-%m-%d} ({now:%A}); current year: {now.year}")
+    output_parts.append(
+        "Use this runtime date for relative-date terms; source snippets and page text may be stale."
+    )
     output_parts.append(f"Searched {len(search_results)} results, fetched {len(fetched_content)} pages")
     output_parts.append("=" * 70)
     output_parts.append("")
@@ -424,7 +430,7 @@ def comprehensive_web_search(
         "1. Use the above web search results and fetched content to answer the user's question\n"
         "2. Prioritize information from the FETCHED PAGE CONTENT section as it contains actual page data\n"
         "3. Cross-reference multiple sources when possible\n"
-        "4. If the information is time-sensitive, pay attention to the age of the results\n"
+        "4. If the information is time-sensitive, use the runtime current date above as authoritative and pay attention to the age of the results\n"
         "5. Be explicit if the search results don't contain sufficient information to fully answer the question"
     )
     output_parts.append(instructions)

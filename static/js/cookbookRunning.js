@@ -412,38 +412,73 @@ export function _tmuxCmd(task, tmuxArgs) {
   return `tmux ${tmuxArgs} 2>/dev/null`;
 }
 
-function _winSessionCmd(task, tmuxArgs) {
-  const sd = '$env:TEMP\\odysseus-sessions';
-  const sid = task.sessionId;
+function _psSingleQuoted(value) {
+  return String(value || '').replace(/'/g, "''");
+}
+
+function _psEncodedCommand(script) {
+  // PowerShell -EncodedCommand expects UTF-16LE bytes encoded as base64.
+  const bytes = [];
+  for (let i = 0; i < script.length; i++) {
+    const code = script.charCodeAt(i);
+    bytes.push(String.fromCharCode(code & 0xff));
+    bytes.push(String.fromCharCode((code >> 8) & 0xff));
+  }
+  return btoa(bytes.join(''));
+}
+
+function _winPowerShellCmd(task, script) {
   const pf = _sshPrefix(_getPort(task));
-  const host = task.remoteHost;
+  return `ssh ${pf}${task.remoteHost} powershell -NoProfile -EncodedCommand ${_psEncodedCommand(script)}`;
+}
+
+function _winSessionCmd(task, tmuxArgs) {
+  const sid = _psSingleQuoted(task.sessionId);
+  const taskName = _psSingleQuoted(`Odysseus-${task.sessionId}`);
   if (tmuxArgs.includes('capture-pane')) {
     const lines = tmuxArgs.match(/-S\s*-?(\d+)/)?.[1] || '200';
-    const ps = `Get-Content '${sd}\\${sid}.log' -Tail ${lines} -ErrorAction SilentlyContinue`;
-    return `ssh ${pf}${host} "powershell -Command \\"${ps}\\""`;
+    const ps = `Get-Content (Join-Path $env:TEMP 'odysseus-sessions\\${sid}.log') -Tail ${lines} -ErrorAction SilentlyContinue`;
+    return _winPowerShellCmd(task, ps);
   }
   if (tmuxArgs.includes('has-session')) {
-    const ps = `$p = Get-Content '${sd}\\${sid}.pid' -ErrorAction SilentlyContinue; if ($p) { Get-Process -Id $p -ErrorAction SilentlyContinue | Out-Null; if ($?) { exit 0 } else { exit 1 } } else { exit 1 }`;
-    return `ssh ${pf}${host} "powershell -Command \\"${ps}\\""`;
+    const ps = [
+      `$procId = Get-Content (Join-Path $env:TEMP 'odysseus-sessions\\${sid}.pid') -ErrorAction SilentlyContinue`,
+      `if ($procId) { $proc = Get-Process -Id ([int]$procId) -ErrorAction SilentlyContinue; if ($proc) { exit 0 } }`,
+      `$taskText = schtasks /Query /TN '${taskName}' /V /FO LIST 2>$null | Out-String`,
+      `if ($LASTEXITCODE -eq 0 -and $taskText -match 'Status:\\s+Running') { exit 0 }`,
+      `exit 1`,
+    ].join('; ');
+    return _winPowerShellCmd(task, ps);
   }
   if (tmuxArgs.includes('kill-session')) {
-    const ps = `$p = Get-Content '${sd}\\${sid}.pid' -ErrorAction SilentlyContinue; if ($p) { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue }; Remove-Item '${sd}\\${sid}.*' -Force -ErrorAction SilentlyContinue`;
-    return `ssh ${pf}${host} "powershell -Command \\"${ps}\\""`;
+    const ps = [
+      `$procId = Get-Content (Join-Path $env:TEMP 'odysseus-sessions\\${sid}.pid') -ErrorAction SilentlyContinue`,
+      `if ($procId) { Stop-Process -Id ([int]$procId) -Force -ErrorAction SilentlyContinue }`,
+      `schtasks /End /TN '${taskName}' 2>$null | Out-Null`,
+      `schtasks /Delete /TN '${taskName}' /F 2>$null | Out-Null`,
+      `Remove-Item (Join-Path $env:TEMP 'odysseus-sessions\\${sid}.*') -Force -ErrorAction SilentlyContinue`,
+    ].join('; ');
+    return _winPowerShellCmd(task, ps);
   }
   if (tmuxArgs.includes('send-keys') && tmuxArgs.includes('C-c')) {
-    const ps = `$p = Get-Content '${sd}\\${sid}.pid' -ErrorAction SilentlyContinue; if ($p) { Stop-Process -Id $p -ErrorAction SilentlyContinue }`;
-    return `ssh ${pf}${host} "powershell -Command \\"${ps}\\""`;
+    const ps = `$procId = Get-Content (Join-Path $env:TEMP 'odysseus-sessions\\${sid}.pid') -ErrorAction SilentlyContinue; if ($procId) { Stop-Process -Id ([int]$procId) -ErrorAction SilentlyContinue }`;
+    return _winPowerShellCmd(task, ps);
   }
-  return `ssh ${pf}${host} 'tmux ${tmuxArgs}' 2>/dev/null`;
+  return _winPowerShellCmd(task, `tmux ${tmuxArgs}`);
 }
 
 function _tmuxGracefulKill(task) {
   if (_isWindows(task)) {
-    const sd = '$env:TEMP\\odysseus-sessions';
-    const sid = task.sessionId;
-    const pf = _sshPrefix(_getPort(task));
-    const ps = `$p = Get-Content '${sd}\\${sid}.pid' -ErrorAction SilentlyContinue; if ($p) { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue }; Remove-Item '${sd}\\${sid}.*' -Force -ErrorAction SilentlyContinue`;
-    return `ssh ${pf}${task.remoteHost} "powershell -Command \\"${ps}\\""`;
+    const sid = _psSingleQuoted(task.sessionId);
+    const taskName = _psSingleQuoted(`Odysseus-${task.sessionId}`);
+    const ps = [
+      `$procId = Get-Content (Join-Path $env:TEMP 'odysseus-sessions\\${sid}.pid') -ErrorAction SilentlyContinue`,
+      `if ($procId) { Stop-Process -Id ([int]$procId) -Force -ErrorAction SilentlyContinue }`,
+      `schtasks /End /TN '${taskName}' 2>$null | Out-Null`,
+      `schtasks /Delete /TN '${taskName}' /F 2>$null | Out-Null`,
+      `Remove-Item (Join-Path $env:TEMP 'odysseus-sessions\\${sid}.*') -Force -ErrorAction SilentlyContinue`,
+    ].join('; ');
+    return _winPowerShellCmd(task, ps);
   }
   if (task.remoteHost) {
     return `ssh ${_sshPrefix(_getPort(task))}${task.remoteHost} 'tmux send-keys -t ${task.sessionId} C-c 2>/dev/null; sleep 2; tmux kill-session -t ${task.sessionId} 2>/dev/null'`;
@@ -1648,8 +1683,8 @@ export function _renderRunningTab() {
           }});
         }
         if (_isWindows(task)) {
-          const sd = '$env:TEMP\\odysseus-sessions';
-          const logCmd = `ssh ${_sshPrefix(_getPort(task))}${task.remoteHost} "powershell -Command \\"Get-Content '${sd}\\${task.sessionId}.log' -Wait\\""`;
+          const sid = _psSingleQuoted(task.sessionId);
+          const logCmd = _winPowerShellCmd(task, `Get-Content (Join-Path $env:TEMP 'odysseus-sessions\\${sid}.log') -Wait -ErrorAction SilentlyContinue`);
           items.push({ label: 'Copy log cmd', action: 'copy-tmux', custom: () => {
             _copyText(logCmd);
           }});
@@ -2547,6 +2582,37 @@ async function _pollBackgroundStatus() {
     if (!res.ok) return;
     const data = await res.json();
     const tasks = data.tasks || [];
+
+    // Let the server-side process check correct stale local state. This matters
+    // most for Windows tasks: the first UI poll can land before the scheduled
+    // task has written its PID/log, briefly making the local card look crashed
+    // even though the PC task starts a moment later.
+    {
+      const localTasks = _loadTasks();
+      let changed = false;
+      for (const t of tasks) {
+        const localTask = localTasks.find(lt => lt.sessionId === t.session_id);
+        if (!localTask) continue;
+        const nextStatus = t.status === 'completed' ? 'done'
+          : (t.status === 'ready' ? 'running' : t.status);
+        if (nextStatus && localTask.status !== nextStatus) {
+          localTask.status = nextStatus;
+          changed = true;
+        }
+        if (t.progress && localTask.progress !== t.progress) {
+          localTask.progress = t.progress;
+          changed = true;
+        }
+        if (t.output_tail && localTask.output !== t.output_tail) {
+          localTask.output = t.output_tail;
+          changed = true;
+        }
+      }
+      if (changed) {
+        localStorage.setItem(TASKS_KEY, JSON.stringify(localTasks.map(_stripTaskSecrets)));
+        _renderRunningTab();
+      }
+    }
 
     const statusEl = document.getElementById('cookbook-bg-status');
     const activeTasks = tasks.filter(t => t.status === 'running' || t.status === 'ready');

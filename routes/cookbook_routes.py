@@ -1,6 +1,7 @@
 """Cookbook routes — model download, serve, cache scanning, and cookbook state sync."""
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -49,6 +50,25 @@ _HF_TOKEN_STATUS_SNIPPET = (
     'Add one in Odysseus Settings -> Cookbook -> HuggingFace Token."; '
     'fi'
 )
+
+
+def _ps_encoded_command(script: str) -> str:
+    return base64.b64encode(script.encode("utf-16le")).decode("ascii")
+
+
+def _windows_scheduled_task_launch_script(session_id: str, remote_runner: str) -> str:
+    task_name = f"Odysseus-{session_id}"
+    return (
+        f"$taskName = '{task_name}'; "
+        "$sd = Join-Path $env:TEMP 'odysseus-sessions'; "
+        "New-Item -ItemType Directory -Force -Path $sd | Out-Null; "
+        f"$runner = Join-Path $env:USERPROFILE '{remote_runner}'; "
+        "$tr = 'powershell -NoProfile -ExecutionPolicy Bypass -File \"' + $runner + '\"'; "
+        "$st = (Get-Date).AddMinutes(5).ToString('HH:mm'); "
+        "schtasks /Delete /TN $taskName /F 2>$null | Out-Null; "
+        "schtasks /Create /TN $taskName /SC ONCE /ST $st /TR $tr /F | Out-Null; "
+        "schtasks /Run /TN $taskName | Out-Null"
+    )
 
 def setup_cookbook_routes() -> APIRouter:
     router = APIRouter(tags=["cookbook"])
@@ -461,35 +481,51 @@ def setup_cookbook_routes() -> APIRouter:
             ps_lines = []
             ps_lines.append('$sessionDir = "$env:TEMP\\odysseus-sessions"')
             ps_lines.append('New-Item -ItemType Directory -Force -Path $sessionDir | Out-Null')
+            ps_lines.append(f'$PID | Out-File "$sessionDir\\{session_id}.pid"')
+            ps_lines.append(f'$logPath = "$sessionDir\\{session_id}.log"')
+            ps_lines.append(f'"DOWNLOAD_START {req.repo_id}" | Out-File $logPath -Force')
             if req.hf_token:
                 ps_lines.append(f"$env:HF_TOKEN = '{_ps_squote(req.hf_token)}'")
             if req.env_prefix:
                 ps_lines.append(_safe_env_prefix(req.env_prefix))
-            # Try hf CLI, fall back to Python huggingface_hub, then auto-install
-            ps_lines.append('try {{')
-            ps_lines.append('  $hfPath = Get-Command hf -ErrorAction SilentlyContinue')
-            ps_lines.append('  if ($hfPath) {{')
-            # Pipe $null to stdin to suppress interactive "update available? [Y/n]" prompt
-            ps_lines.append(f'    $null | {hf_cmd}')
-            ps_lines.append('  }} else {{')
-            ps_lines.append('    python -c "import huggingface_hub" 2>$null')
-            ps_lines.append('    if ($LASTEXITCODE -eq 0) {{')
-            ps_lines.append('      Write-Host "hf CLI not found, using Python huggingface_hub..."')
-            ps_lines.append('      python -m pip install -q hf_transfer 2>$null')
-            ps_lines.append('      $env:HF_HUB_ENABLE_HF_TRANSFER = "1"')
-            ps_lines.append(f"      python -c \"import os; from huggingface_hub import snapshot_download; snapshot_download('{req.repo_id}'{_dl_pyarg}, max_workers=8)\"")
-            ps_lines.append('    }} else {{')
-            ps_lines.append('      Write-Host "Installing huggingface-hub..."')
-            ps_lines.append('      python -m pip install -q huggingface-hub hf_transfer')
-            ps_lines.append('      $env:HF_HUB_ENABLE_HF_TRANSFER = "1"')
-            ps_lines.append(f"      python -c \"import os; from huggingface_hub import snapshot_download; snapshot_download('{req.repo_id}'{_dl_pyarg}, max_workers=8)\"")
-            ps_lines.append('    }}')
-            ps_lines.append('  }}')
-            ps_lines.append('  if ($LASTEXITCODE -eq 0) {{ Write-Host ""; Write-Host "DOWNLOAD_OK" }}')
-            ps_lines.append('  else {{ Write-Host ""; Write-Host "DOWNLOAD_FAILED (exit $LASTEXITCODE)" }}')
-            ps_lines.append('}} catch {{')
-            ps_lines.append('  Write-Host ""; Write-Host "DOWNLOAD_FAILED ($_)"')
-            ps_lines.append('}}')
+            # Windows scheduled tasks can leave hf.exe attached to a hidden
+            # console with no useful log output. Use the Python API directly so
+            # stdout/stderr redirection and resume behavior are predictable.
+            _py_workers = 4 if req.disable_hf_transfer else 8
+            ps_lines.append('try {')
+            ps_lines.append('  $python = $null')
+            ps_lines.append('  $pyCandidates = @(')
+            ps_lines.append('    "$env:LOCALAPPDATA\\Programs\\Python\\Python314\\python.exe",')
+            ps_lines.append('    "$env:LOCALAPPDATA\\Programs\\Python\\Python313\\python.exe",')
+            ps_lines.append('    "$env:LOCALAPPDATA\\Programs\\Python\\Python312\\python.exe",')
+            ps_lines.append('    "$env:LOCALAPPDATA\\Programs\\Python\\Python311\\python.exe"')
+            ps_lines.append('  )')
+            ps_lines.append('  foreach ($p in $pyCandidates) { if (Test-Path $p) { $python = $p; break } }')
+            ps_lines.append('  if (-not $python) {')
+            ps_lines.append('    $cmdPy = Get-Command python -ErrorAction SilentlyContinue')
+            ps_lines.append('    if ($cmdPy -and $cmdPy.Source -notlike "*\\WindowsApps\\*") { $python = $cmdPy.Source }')
+            ps_lines.append('  }')
+            ps_lines.append('  if (-not $python) { Write-Host "DOWNLOAD_FAILED (Python not found on Windows host)"; exit 1 }')
+            ps_lines.append('  $pythonDir = Split-Path $python -Parent')
+            ps_lines.append('  $pythonScripts = Join-Path $pythonDir "Scripts"')
+            ps_lines.append('  $userScripts = Join-Path $env:APPDATA "Python\\Python312\\Scripts"')
+            ps_lines.append('  $env:PATH = "$pythonScripts;$userScripts;$pythonDir;$env:PATH"')
+            if req.disable_hf_transfer:
+                ps_lines.append('  $env:HF_HUB_ENABLE_HF_TRANSFER = "0"')
+                ps_lines.append('  $env:HF_HUB_DOWNLOAD_MAX_WORKERS = "4"')
+                ps_lines.append('  & $python -m pip install -q -U huggingface_hub *>> $logPath')
+                ps_lines.append('  if ($LASTEXITCODE -ne 0) { throw "pip install huggingface_hub failed with exit $LASTEXITCODE" }')
+            else:
+                ps_lines.append('  $env:HF_HUB_ENABLE_HF_TRANSFER = "1"')
+                ps_lines.append('  $env:HF_HUB_DOWNLOAD_MAX_WORKERS = "8"')
+                ps_lines.append('  & $python -m pip install -q -U huggingface_hub hf_transfer *>> $logPath')
+                ps_lines.append('  if ($LASTEXITCODE -ne 0) { throw "pip install huggingface_hub/hf_transfer failed with exit $LASTEXITCODE" }')
+            ps_lines.append(f"  & $python -c \"import os; from huggingface_hub import snapshot_download; snapshot_download('{req.repo_id}'{_dl_pyarg}, max_workers={_py_workers})\" *>> $logPath")
+            ps_lines.append('  if ($LASTEXITCODE -eq 0) { "" | Add-Content $logPath; "DOWNLOAD_OK" | Add-Content $logPath }')
+            ps_lines.append('  else { "" | Add-Content $logPath; "DOWNLOAD_FAILED (exit $LASTEXITCODE)" | Add-Content $logPath }')
+            ps_lines.append('} catch {')
+            ps_lines.append('  "" | Add-Content $logPath; "DOWNLOAD_FAILED ($_)" | Add-Content $logPath')
+            ps_lines.append('}')
             ps_lines.append(f'Remove-Item -Force "$HOME\\{remote_runner}" -ErrorAction SilentlyContinue')
             runner_path = TMUX_LOG_DIR / f"{session_id}_run.ps1"
             runner_path.write_text("\r\n".join(ps_lines) + "\r\n", encoding="utf-8")
@@ -498,17 +534,11 @@ def setup_cookbook_routes() -> APIRouter:
             _port = req.ssh_port
             _Pf = f"-P {_port} " if _port and _port != "22" else ""
             _pf = f"-p {_port} " if _port and _port != "22" else ""
-            # Start-Process creates a fully detached process that survives SSH disconnect
-            launch_ps = (
-                "$sd = \\\"$env:TEMP\\odysseus-sessions\\\"; "
-                f"Start-Process powershell -ArgumentList '-ExecutionPolicy','Bypass','-File','$HOME\\{remote_runner}' "
-                f"-RedirectStandardOutput \\\"$sd\\{session_id}.log\\\" "
-                f"-RedirectStandardError \\\"$sd\\{session_id}.err.log\\\" "
-                f"-NoNewWindow -PassThru | ForEach-Object {{ $_.Id | Out-File \\\"$sd\\{session_id}.pid\\\" }}"
-            )
+            launch_ps = _windows_scheduled_task_launch_script(session_id, remote_runner)
+            launch_cmd = f"powershell -NoProfile -EncodedCommand {_ps_encoded_command(launch_ps)}"
             setup_cmd = (
                 f"scp -O {_Pf}-q '{runner_path}' {remote}:{remote_runner} && "
-                f'ssh {_pf}{remote} "powershell -Command \\"{launch_ps}\\""'
+                f"ssh {_pf}{remote} {shlex.quote(launch_cmd)}"
             )
 
         elif remote:
@@ -837,6 +867,8 @@ def setup_cookbook_routes() -> APIRouter:
             ps_lines = []
             ps_lines.append('$sessionDir = "$env:TEMP\\odysseus-sessions"')
             ps_lines.append('New-Item -ItemType Directory -Force -Path $sessionDir | Out-Null')
+            ps_lines.append(f'$PID | Out-File "$sessionDir\\{session_id}.pid"')
+            ps_lines.append(f'Start-Transcript -Path "$sessionDir\\{session_id}.log" -Force | Out-Null')
             if req.hf_token:
                 ps_lines.append(f"$env:HF_TOKEN = '{_ps_squote(req.hf_token)}'")
             if req.gpus:
@@ -863,22 +895,18 @@ def setup_cookbook_routes() -> APIRouter:
             ps_lines.append(req.cmd)
             ps_lines.append('Write-Host ""')
             ps_lines.append('Write-Host "=== Process exited with code $LASTEXITCODE ==="')
+            ps_lines.append('try { Stop-Transcript | Out-Null } catch {}')
             runner_path = TMUX_LOG_DIR / f"{session_id}_run.ps1"
             runner_path.write_text("\r\n".join(ps_lines) + "\r\n", encoding="utf-8")
 
             _port = req.ssh_port
             _Pf = f"-P {_port} " if _port and _port != "22" else ""
             _pf = f"-p {_port} " if _port and _port != "22" else ""
-            launch_ps = (
-                "$sd = \\\"$env:TEMP\\odysseus-sessions\\\"; "
-                f"Start-Process powershell -ArgumentList '-ExecutionPolicy','Bypass','-File','$HOME\\{remote_runner}' "
-                f"-RedirectStandardOutput \\\"$sd\\{session_id}.log\\\" "
-                f"-RedirectStandardError \\\"$sd\\{session_id}.err.log\\\" "
-                f"-NoNewWindow -PassThru | ForEach-Object {{ $_.Id | Out-File \\\"$sd\\{session_id}.pid\\\" }}"
-            )
+            launch_ps = _windows_scheduled_task_launch_script(session_id, remote_runner)
+            launch_cmd = f"powershell -NoProfile -EncodedCommand {_ps_encoded_command(launch_ps)}"
             setup_cmd = (
                 f"scp -O {_Pf}-q '{runner_path}' {remote}:{remote_runner} && "
-                f'ssh {_pf}{remote} "powershell -Command \\"{launch_ps}\\""'
+                f"ssh {_pf}{remote} {shlex.quote(launch_cmd)}"
             )
         else:
             # ── Linux/Termux: bash + tmux (existing flow) ──
@@ -1742,6 +1770,7 @@ def setup_cookbook_routes() -> APIRouter:
                 continue
             remote = task.get("remoteHost", "")
             task_type = task.get("type", "download")  # "download" or "serve"
+            saved_status = str(task.get("status") or "").lower()
             # Field name varies depending on whether the task was added
             # via the download flow (`repoId`), the serve flow (`modelId`),
             # or the UI-side serve preset (which uses `name` + `payload.repo_id`).
@@ -1770,24 +1799,50 @@ def setup_cookbook_routes() -> APIRouter:
             if _tport and not _SSH_PORT_RE.match(str(_tport)):
                 logger.warning(f"Skipping task with unsafe sshPort: {_tport!r}")
                 continue
+            if task_type == "download" and saved_status in {"done", "completed"}:
+                results.append({
+                    "session_id": session_id,
+                    "type": task_type,
+                    "model": model.split("/")[-1] if "/" in model else model,
+                    "status": "completed",
+                    "progress": "",
+                    "phase": "",
+                    "diagnosis": None,
+                    "output_tail": str(task.get("output") or "")[-5000:],
+                    "cmd": _payload.get("_cmd") or "",
+                    "tps": None,
+                    "reqs": None,
+                    "pct": None,
+                    "remote": remote or "local",
+                })
+                continue
             if task_platform == "windows" and remote:
                 # Windows: check PID file + Get-Process, read log tail
                 sd = "$env:TEMP\\odysseus-sessions"
                 ssh_base = ["ssh"]
                 if _tport and _tport != "22":
                     ssh_base.extend(["-p", str(_tport)])
+                check_script = (
+                    f"$procId = Get-Content \"{sd}\\{session_id}.pid\" -ErrorAction SilentlyContinue; "
+                    "if ($procId) { $proc = Get-Process -Id ([int]$procId) -ErrorAction SilentlyContinue; if ($proc) { exit 0 } }; "
+                    f"$taskText = schtasks /Query /TN \"Odysseus-{session_id}\" /V /FO LIST 2>$null | Out-String; "
+                    "if ($LASTEXITCODE -eq 0 -and $taskText -match 'Status:\\s+Running') { exit 0 }; "
+                    "exit 1"
+                )
+                capture_script = f"Get-Content \"{sd}\\{session_id}.log\" -Tail 10 -ErrorAction SilentlyContinue"
                 check_cmd = ssh_base + [
                     remote,
                     "powershell",
-                    "-Command",
-                    f"$pid = Get-Content \"{sd}\\{session_id}.pid\" -ErrorAction SilentlyContinue; "
-                    "if ($pid) {{ Get-Process -Id $pid -ErrorAction SilentlyContinue | Out-Null; if ($?) {{ exit 0 }} else {{ exit 1 }} }} else {{ exit 1 }}"
+                    "-NoProfile",
+                    "-EncodedCommand",
+                    _ps_encoded_command(check_script),
                 ]
                 capture_cmd = ssh_base + [
                     remote,
                     "powershell",
-                    "-Command",
-                    f"Get-Content \"{sd}\\{session_id}.log\" -Tail 10 -ErrorAction SilentlyContinue",
+                    "-NoProfile",
+                    "-EncodedCommand",
+                    _ps_encoded_command(capture_script),
                 ]
             elif remote:
                 ssh_base = ["ssh"]
@@ -1871,13 +1926,15 @@ def setup_cookbook_routes() -> APIRouter:
                     status = "error"
                 elif has_exit and "unrecognized arguments" in lower:
                     status = "error"
-                elif has_error and not ("application startup complete" in lower):
-                    status = "error"
-                elif task_type == "download" and ("100%" in full_snapshot or "DOWNLOAD_OK" in full_snapshot):
+                elif task_type == "download" and "DOWNLOAD_OK" in full_snapshot:
                     # Only download tasks treat 100% as "completed".
                     # Serve tasks log 100%|██████| during inference progress
                     # (diffusion sampling, etc.) — that's "running", not done.
                     status = "completed"
+                elif task_type == "download" and ("download_failed" in lower or "traceback" in lower):
+                    status = "error"
+                elif task_type != "download" and has_error and not ("application startup complete" in lower):
+                    status = "error"
                 elif "application startup complete" in lower:
                     status = "ready"
                 elif not is_alive:
@@ -1887,7 +1944,13 @@ def setup_cookbook_routes() -> APIRouter:
                     status = "running"
             else:
                 # Session is dead — check if it completed or crashed
-                status = "stopped"
+                lower = full_snapshot.lower()
+                if task_type == "download" and ("download_ok" in lower or "100%" in full_snapshot):
+                    status = "completed"
+                elif "download_failed" in lower or "traceback" in lower or "error" in lower:
+                    status = "error"
+                else:
+                    status = "stopped"
 
             # Parse structured phase info — single source of truth for the UI
             phase_info = _parse_serve_phase(full_snapshot, task_type) if (task_type == "serve" and status == "running" and full_snapshot) else {}

@@ -1,4 +1,5 @@
 import os
+import base64
 import platform
 import shutil
 import subprocess
@@ -428,15 +429,11 @@ def _detect_windows():
         "}; "
         "$r | ConvertTo-Json -Compress"
     )
+    encoded_cmd = base64.b64encode(ps_cmd.encode("utf-16le")).decode("ascii")
     if _remote_host:
-        # Remote: ship a single command string over SSH. The remote shell parses
-        # the quoting; PowerShell on the far side runs the -Command payload.
-        out = _run(f'powershell -Command "{ps_cmd}"')
+        out = _run(f"powershell -NoProfile -EncodedCommand {encoded_cmd}")
     else:
-        # Local: pass a LIST argv straight to subprocess so the OS hands ps_cmd
-        # to PowerShell verbatim — no fragile string-level quote escaping. Prefer
-        # pwsh (PS7), else Windows PowerShell 5.1.
-        out = _run([_powershell_exe(), "-NoProfile", "-NonInteractive", "-Command", ps_cmd])
+        out = _run([_powershell_exe(), "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded_cmd])
     if not out:
         return None
     import json as _json

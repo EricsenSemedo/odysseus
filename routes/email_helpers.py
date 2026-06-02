@@ -43,23 +43,28 @@ def _send_smtp_message(cfg: dict, from_addr: str, recipients: list[str], message
     """Send through SMTP using the conventional TLS mode for the configured port.
 
     Account settings only store host/port today. Port 465 is implicit TLS
-    (SMTP_SSL); port 587 is plain SMTP upgraded with STARTTLS. Using SSL
-    directly against 587 raises the classic "[SSL: WRONG_VERSION_NUMBER]"
-    error even when credentials are correct.
+    (SMTP_SSL). Other ports use plain SMTP and upgrade with STARTTLS when the
+    server advertises it. This covers Proton Mail Bridge's common SMTP port
+    1025 without sending credentials to a remote cleartext server.
     """
     host = cfg["smtp_host"]
     port = int(cfg.get("smtp_port") or 465)
     user = cfg.get("smtp_user") or ""
     password = cfg.get("smtp_password") or ""
-    def _send_starttls(starttls_port: int = 587) -> None:
+    def _send_starttls(starttls_port: int) -> None:
         with smtplib.SMTP(host, starttls_port, timeout=timeout) as smtp:
-            smtp.starttls()
+            smtp.ehlo()
+            if smtp.has_extn("starttls"):
+                smtp.starttls()
+                smtp.ehlo()
+            elif user or password:
+                raise RuntimeError("SMTP server does not advertise STARTTLS; use port 465 for SSL or enable STARTTLS")
             if user and password:
                 smtp.login(user, password)
             smtp.sendmail(from_addr, recipients, message)
 
-    if port == 587:
-        _send_starttls(587)
+    if port != 465:
+        _send_starttls(port)
         return
 
     try:

@@ -33,10 +33,11 @@ _TOKEN_RE = re.compile(r"^[A-Za-z0-9._~+/=-]+$")
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _SSH_PORT_RE = re.compile(r"^\d{1,5}$")
 _GPU_LIST_RE = re.compile(r"^\d+(?:,\d+)*$")
-# A download target directory. Absolute or ~-relative path; safe path glyphs
-# only (no quotes, shell metacharacters, or spaces) since it lands in a shell
-# command. A leading ~ is expanded to $HOME at command-build time.
-_LOCAL_DIR_RE = re.compile(r"^~?/[A-Za-z0-9._/-]*$|^~$")
+# A download target directory. Unix absolute, Unix ~-relative, or Windows
+# drive-absolute path; safe path glyphs only (no quotes, shell metacharacters,
+# or spaces) since it lands in a shell/PowerShell command. A leading ~ is
+# expanded to $HOME at command-build time.
+_LOCAL_DIR_RE = re.compile(r"^(?:~?/[A-Za-z0-9._/-]*|~|[A-Za-z]:[\\/][A-Za-z0-9._/\\-]*)$")
 
 
 def _validate_repo_id(v: str | None) -> str:
@@ -82,7 +83,7 @@ def _validate_local_dir(v: str | None) -> str | None:
         return None
     v = v.rstrip("/") or "/"
     if not _LOCAL_DIR_RE.match(v):
-        raise HTTPException(400, "Invalid local_dir — must be an absolute or ~ path with no spaces or shell metacharacters")
+        raise HTTPException(400, "Invalid local_dir — must be an absolute, Windows drive, or ~ path with no spaces or shell metacharacters")
     return v
 
 

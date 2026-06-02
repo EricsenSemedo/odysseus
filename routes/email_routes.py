@@ -3115,11 +3115,16 @@ def setup_email_routes():
             smtp_user = (body.get("smtp_user") or imap_user).strip()
             smtp_pass = body.get("smtp_password") or imap_pass
             try:
-                if smtp_port == 587:
-                    smtp = smtplib.SMTP(smtp_host, smtp_port, timeout=10)
-                    smtp.starttls()
-                else:
+                if smtp_port == 465:
                     smtp = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=10)
+                else:
+                    smtp = smtplib.SMTP(smtp_host, smtp_port, timeout=10)
+                    smtp.ehlo()
+                    if smtp.has_extn("starttls"):
+                        smtp.starttls()
+                        smtp.ehlo()
+                    elif smtp_user or smtp_pass:
+                        raise RuntimeError("SMTP server does not advertise STARTTLS; use port 465 for SSL or enable STARTTLS")
                 try:
                     smtp.login(smtp_user, smtp_pass)
                     smtp_result = {"ok": True}

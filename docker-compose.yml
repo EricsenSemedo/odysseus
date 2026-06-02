@@ -26,6 +26,10 @@ services:
       - SEARXNG_INSTANCE=http://searxng:8080
       - CHROMADB_HOST=chromadb
       - CHROMADB_PORT=8000
+      # Timezone used for runtime prompt/search context. Docker defaults to
+      # UTC unless this is set; override APP_TIMEZONE in .env for your locale.
+      - APP_TIMEZONE=${APP_TIMEZONE:-America/New_York}
+      - TZ=${TZ:-America/New_York}
       # PUID / PGID — the user/group the container drops to before
       # running uvicorn (entrypoint also chowns /app/data + /app/logs
       # to match, so bind-mounted files stay editable from the host).

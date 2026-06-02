@@ -1,17 +1,13 @@
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 
-class _FixedDateTime(datetime):
-    @classmethod
-    def now(cls, tz=None):
-        value = cls(2026, 6, 2, 22, 37, 0)
-        if tz is not None:
-            return value.replace(tzinfo=tz)
-        return value
+def _fixed_now():
+    return datetime(2026, 6, 2, 22, 37, 0, tzinfo=ZoneInfo("America/New_York"))
 
 
 def _assert_runtime_search_context(module, monkeypatch):
-    monkeypatch.setattr(module, "datetime", _FixedDateTime)
+    monkeypatch.setattr(module, "runtime_now", _fixed_now)
     monkeypatch.setattr(module, "_get_search_settings", lambda: {"search_provider": "searxng"})
     monkeypatch.setattr(module, "_get_result_count", lambda: 1)
     monkeypatch.setattr(
@@ -57,3 +53,14 @@ def test_route_search_context_has_authoritative_runtime_timestamp(monkeypatch):
     from services.search import core
 
     _assert_runtime_search_context(core, monkeypatch)
+
+
+def test_chat_runtime_context_uses_configured_timezone(monkeypatch):
+    import src.chat_processor as chat_processor
+
+    monkeypatch.setattr(chat_processor, "runtime_now", _fixed_now)
+
+    content = chat_processor.build_runtime_context_message()["content"]
+
+    assert "current date is 2026-06-02 (Tuesday) in EDT" in content
+    assert "current calendar year is 2026" in content

@@ -39,6 +39,7 @@ from .content import (
     extract_quotes,
     extract_statistics,
 )
+from src.runtime_context import runtime_now
 
 logger = logging.getLogger(__name__)
 
@@ -376,7 +377,7 @@ def comprehensive_web_search(
     output_parts.append("=" * 70)
     output_parts.append("WEB SEARCH RESULTS AND FETCHED CONTENT")
     output_parts.append(f"Query: {query}")
-    now = datetime.now().astimezone()
+    now = runtime_now()
     generated_at = f"{now:%Y-%m-%d %H:%M:%S %Z}"
     output_parts.append(f"Search generated at: {generated_at}")
     output_parts.append(f"Current calendar date: {now:%Y-%m-%d} ({now:%A}); current year: {now.year}")

@@ -363,8 +363,13 @@ def comprehensive_web_search(
     output_parts.append("WEB SEARCH RESULTS AND FETCHED CONTENT")
     output_parts.append(f"Query: {query}")
     now = datetime.now().astimezone()
-    output_parts.append(f"Search generated at: {now:%Y-%m-%d %H:%M:%S %Z}")
+    generated_at = f"{now:%Y-%m-%d %H:%M:%S %Z}"
+    output_parts.append(f"Search generated at: {generated_at}")
     output_parts.append(f"Current calendar date: {now:%Y-%m-%d} ({now:%A}); current year: {now.year}")
+    output_parts.append(
+        "Authoritative timestamp rule: if the user asks when this search ran, "
+        "answer using 'Search generated at' above, not dates found inside fetched pages or snippets."
+    )
     output_parts.append(
         "Use this runtime date for relative-date terms; source snippets and page text may be stale."
     )
@@ -430,8 +435,9 @@ def comprehensive_web_search(
         "1. Use the above web search results and fetched content to answer the user's question\n"
         "2. Prioritize information from the FETCHED PAGE CONTENT section as it contains actual page data\n"
         "3. Cross-reference multiple sources when possible\n"
-        "4. If the information is time-sensitive, use the runtime current date above as authoritative and pay attention to the age of the results\n"
-        "5. Be explicit if the search results don't contain sufficient information to fully answer the question"
+        "4. If the user asks when the search ran, use only the 'Search generated at' timestamp above; do not infer the search-run date from source content\n"
+        "5. If the information is time-sensitive, use the runtime current date above as authoritative and pay attention to the age of the results\n"
+        "6. Be explicit if the search results don't contain sufficient information to fully answer the question"
     )
     output_parts.append(instructions)
 

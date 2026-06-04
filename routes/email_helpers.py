@@ -23,6 +23,7 @@ import json
 import re
 import html
 import logging
+from functools import lru_cache
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
@@ -37,6 +38,71 @@ from src.auth_helpers import get_current_user
 from src.secret_storage import decrypt as _decrypt
 
 logger = logging.getLogger(__name__)
+
+
+# Canonical email tags used by the classifier, tag filters, and inbox pills.
+EMAIL_CATEGORY_TAGS = {
+    "work", "personal", "finance", "bills", "receipt", "travel",
+    "newsletter", "marketing", "notification", "security", "social",
+    "shopping", "calendar", "job-applications",
+    "job-recruiter", "job-application-update", "job-interview",
+    "job-assessment", "job-rejection", "job-offer",
+}
+EMAIL_MANAGED_TAGS = EMAIL_CATEGORY_TAGS | {"urgent", "reply-soon", "promo"}
+
+
+def normalize_email_tag(tag: str | None) -> str:
+    """Normalize stored/displayed email tags to one canonical spelling."""
+    value = re.sub(r"\s+", "-", str(tag or "").strip().lower().replace("_", "-"))
+    if value == "promo":
+        return "marketing"
+    return value
+
+
+@lru_cache(maxsize=1)
+def _job_application_patterns() -> tuple[re.Pattern[str], ...]:
+    return (
+        re.compile(
+            r"\b("
+            r"recruiter|recruiting coordinator|talent acquisition|hiring team|candidate"
+            r"|job application|application status|application update|thanks for applying"
+            r"|we received your application|your application"
+            r"|interview|phone screen|technical screen|onsite|on-site|panel interview"
+            r"|take-home|take home|coding challenge|coding assessment|assessment"
+            r"|offer letter|job offer|verbal offer|compensation package|background check"
+            r"|position|role|opening"
+            r"|rejection|not moving forward|next steps"
+            r")\b",
+            re.I,
+        ),
+    )
+
+
+def looks_like_job_application_email(*parts: str | None) -> bool:
+    """Heuristic catch for obvious job-application mail independent of the LLM."""
+    blob = "\n".join(str(p or "") for p in parts)
+    return any(p.search(blob) for p in _job_application_patterns())
+
+
+@lru_cache(maxsize=1)
+def _job_stage_patterns() -> tuple[tuple[str, re.Pattern[str]], ...]:
+    return (
+        ("job-offer", re.compile(r"\b(offer letter|job offer|verbal offer|compensation package|background check)\b", re.I)),
+        ("job-rejection", re.compile(r"\b(rejection|not moving forward|unfortunately|decided to move forward with other candidates|other candidates)\b", re.I)),
+        ("job-interview", re.compile(r"\b(interview|phone screen|technical screen|onsite|on-site|panel interview|meet the team)\b", re.I)),
+        ("job-assessment", re.compile(r"\b(take-home|take home|coding challenge|coding assessment|online assessment|assessment)\b", re.I)),
+        ("job-application-update", re.compile(r"\b(job application|application status|application update|thanks for applying|we received your application|your application|next steps)\b", re.I)),
+        ("job-recruiter", re.compile(r"\b(recruiter|recruiting coordinator|talent acquisition|hiring team|sourcer)\b", re.I)),
+    )
+
+
+def classify_job_application_stage(*parts: str | None) -> str | None:
+    """Return the most likely job stage tag, if one is obvious."""
+    blob = "\n".join(str(p or "") for p in parts)
+    for tag, pattern in _job_stage_patterns():
+        if pattern.search(blob):
+            return tag
+    return None
 
 
 def _send_smtp_message(cfg: dict, from_addr: str, recipients: list[str], message: str | bytes, timeout: int = 30) -> None:

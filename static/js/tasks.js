@@ -329,6 +329,7 @@ const _TASK_ICONS = {
   mark_email_boundaries:'<path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M9 4v16"/>',
   learn_sender_signatures:'<path d="M20 6 9 17l-5-5"/><path d="M14 6h6v6"/>',
   check_email_urgency: '<path d="M13.73 21a2 2 0 0 1-3.46 0"/><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>',
+  backfill_email_job_tags: '<path d="M21 12a9 9 0 1 1-3.2-6.9"/><path d="M21 3v6h-6"/>',
   // Skills
   test_skills:         '<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
   audit_skills:        '<path d="M9 11l3 3L22 4"/><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v15H6.5A2.5 2.5 0 0 0 4 19.5z"/>',
@@ -479,6 +480,7 @@ const _CATEGORY_MAP = {
   mark_email_boundaries:      'Email',
   learn_sender_signatures:    'Email',
   check_email_urgency:        'Email',
+  backfill_email_job_tags:    'Email',
   daily_brief:                'Assistant',
   test_skills:                'Skills',
   audit_skills:               'Skills',
@@ -590,6 +592,7 @@ const _TASK_CACHE_LABELS = {
   mark_email_boundaries: 'email boundaries',
   learn_sender_signatures: 'sender signatures',
   check_email_urgency: 'email tags',
+  backfill_email_job_tags: 'job email tags',
 };
 
 function _taskClearCacheLabel(taskOrEntry) {
@@ -1071,7 +1074,7 @@ function _showForm(existing, initTaskType, initTriggerType) {
         extra.innerHTML = `
           <label class="task-form-label">Email triage rules</label>
           <textarea id="task-form-urgent-email-prompt" class="task-form-input task-form-textarea" rows="4" placeholder="What should count as urgent? e.g. deadlines, blockers, people waiting outside."></textarea>
-          <div class="memory-desc" style="font-size:11px;margin-top:4px;">Pause/resume and schedule are controlled by this task. It tags urgent, reply-soon, newsletter, marketing, and spam. Urgent/reply-soon emails use your reminder settings.</div>
+          <div class="memory-desc" style="font-size:11px;margin-top:4px;">Pause/resume and schedule are controlled by this task. It tags urgent, reply-soon, job-applications, newsletter, marketing, and spam. Urgent/reply-soon emails use your reminder settings.</div>
         `;
         const settings = await _fetchUrgentEmailSettings();
         const promptEl = document.getElementById('task-form-urgent-email-prompt');

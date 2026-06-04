@@ -1,8 +1,12 @@
 services:
   odysseus:
     build: .
-    ports:
-      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-7000}:7000"
+    # Linux/local-service profile: host networking lets Odysseus reach host
+    # services bound to 127.0.0.1, such as Proton Mail Bridge and local model
+    # servers. This trades away Docker bridge isolation and is not portable to
+    # Docker Desktop's Mac/Windows networking model.
+    network_mode: host
+    command: ["uvicorn", "app:app", "--host", "127.0.0.1", "--port", "7000"]
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -16,16 +20,12 @@ services:
       # land under /app/.local for the odysseus user. Persist them so a
       # container recreate does not silently remove installed serve engines.
       - ./data/local:/app/.local
-    extra_hosts:
-      # Lets the container reach local services on the Docker host, including
-      # Ollama at http://host.docker.internal:11434.
-      - "host.docker.internal:host-gateway"
     env_file:
       - .env
     environment:
-      - SEARXNG_INSTANCE=http://searxng:8080
-      - CHROMADB_HOST=chromadb
-      - CHROMADB_PORT=8000
+      - SEARXNG_INSTANCE=http://127.0.0.1:8080
+      - CHROMADB_HOST=127.0.0.1
+      - CHROMADB_PORT=8100
       # Timezone used for runtime prompt/search context. Docker defaults to
       # UTC unless this is set; override APP_TIMEZONE in .env for your locale.
       - APP_TIMEZONE=${APP_TIMEZONE:-America/New_York}
@@ -54,6 +54,8 @@ services:
     runtime: nvidia
     entrypoint: ["/usr/local/bin/ollama"]
     command: ["serve"]
+    ports:
+      - "127.0.0.1:11434:11434"
     volumes:
       - ${HOME}/.local/bin/ollama:/usr/local/bin/ollama:ro
       - ${HOME}/.local/lib/ollama:/usr/local/lib/ollama:ro

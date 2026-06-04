@@ -633,7 +633,7 @@ class TaskScheduler:
                 count = self._task_defer_counts.get(task_id, 0) + 1
                 self._task_defer_counts[task_id] = count
                 delay_seconds = int(getattr(defer, "delay_seconds", 20 * 60) or (20 * 60))
-                if count > 2:
+                if count > 2 and bool(getattr(defer, "escalate_delay", True)):
                     delay_seconds = max(delay_seconds, 40 * 60)
                 when = datetime.utcnow() + timedelta(seconds=delay_seconds)
                 logger.info(

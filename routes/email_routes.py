@@ -644,6 +644,7 @@ def setup_email_routes():
                 _tag_seq_fallback = []
                 try:
                     import sqlite3 as _sql3t
+                    from routes.email_helpers import normalize_email_tag
                     _ct = _sql3t.connect(SCHEDULED_DB)
                     _owner_aliases = _email_tag_owner_aliases(account_id, owner)
                     _owner_ph = ",".join("?" * len(_owner_aliases))
@@ -676,10 +677,11 @@ def setup_email_routes():
                         for r in rows_t:
                             try:
                                 tg = json.loads(r[2] or "[]")
-                                wanted = {_tag_name}
-                                if _tag_name == "marketing":
+                                _norm_tag_name = normalize_email_tag(_tag_name)
+                                wanted = {_norm_tag_name}
+                                if _norm_tag_name == "marketing":
                                     wanted.add("promo")
-                                row_tags = {str(t).strip().lower().replace("_", "-") for t in tg} if isinstance(tg, list) else set()
+                                row_tags = {normalize_email_tag(t) for t in tg} if isinstance(tg, list) else set()
                                 if wanted.intersection(row_tags):
                                     if r[0]:
                                         _tag_message_ids.append(str(r[0]).strip())
@@ -739,6 +741,7 @@ def setup_email_routes():
             _tag_by_uid = {}
             try:
                 import sqlite3 as _sql3
+                from routes.email_helpers import normalize_email_tag
                 _c = _sql3.connect(SCHEDULED_DB)
                 _uid_strs = [u.decode() for u in uid_list]
                 if _uid_strs:
@@ -756,7 +759,7 @@ def setup_email_routes():
                         except Exception:
                             tg = []
                         if isinstance(tg, list):
-                            tg = ["marketing" if str(t).strip().lower().replace("_", "-") == "promo" else t for t in tg]
+                            tg = [normalize_email_tag(t) for t in tg]
                         _tag_by_uid[r[0]] = {"tags": tg, "spam": bool(r[2])}
                 _c.close()
             except Exception as e:

@@ -9,8 +9,28 @@ from src.chat_helpers import extract_urls
 from src.youtube_handler import is_youtube_url
 from src.search import comprehensive_web_search, fetch_webpage_content
 from src.prompt_security import UNTRUSTED_CONTEXT_POLICY, untrusted_context_message
+from src.runtime_context import runtime_now
 
 logger = logging.getLogger(__name__)
+
+
+def build_runtime_context_message() -> Dict[str, str]:
+    """Trusted runtime facts that should not come from model pretraining."""
+    now = runtime_now()
+    tz_name = now.tzname() or "local time"
+    return {
+        "role": "system",
+        "content": (
+            "Runtime context: "
+            f"the current date is {now:%Y-%m-%d} ({now:%A}) in {tz_name}. "
+            f"The current calendar year is {now.year}. "
+            "Use this as authoritative for relative-date questions such as "
+            "'today', 'now', 'current', 'this year', and 'latest'. If model "
+            "pretraining, memories, retrieved documents, or web search results "
+            "imply a different current date/year, treat them as stale unless "
+            "the user explicitly asks about that source's date."
+        ),
+    }
 
 # ── Stopwords & tokenizer ──
 
@@ -178,6 +198,8 @@ class ChatProcessor:
         """
         preface = []
         rag_sources = []
+
+        preface.append(build_runtime_context_message())
 
         # Add preset system prompt if specified
         if preset_system_prompt:

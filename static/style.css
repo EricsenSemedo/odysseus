@@ -28775,6 +28775,13 @@ body.doc-find-active mark.doc-find-mark.current {
 .email-tag-security { background: rgba(248, 113, 113, 0.22); color: #f87171; }
 .email-tag-urgent { background: color-mix(in srgb, var(--color-error, #e06c75) 25%, transparent); color: var(--color-error, #e06c75); font-weight: 600; }
 .email-tag-reply-soon { background: rgba(240, 173, 78, 0.22); color: #f0ad4e; }
+.email-tag-job-applications { background: rgba(45, 212, 191, 0.22); color: #2dd4bf; }
+.email-tag-job-recruiter { background: rgba(96, 165, 250, 0.22); color: #60a5fa; }
+.email-tag-job-application-update { background: rgba(125, 211, 252, 0.22); color: #7dd3fc; }
+.email-tag-job-interview { background: rgba(196, 181, 253, 0.22); color: #c4b5fd; }
+.email-tag-job-assessment { background: rgba(250, 204, 21, 0.22); color: #facc15; }
+.email-tag-job-rejection { background: rgba(251, 113, 133, 0.22); color: #fb7185; }
+.email-tag-job-offer { background: rgba(74, 222, 128, 0.22); color: #4ade80; }
 .email-tag-social { background: rgba(56, 189, 248, 0.22); color: #38bdf8; }
 .email-tag-shopping { background: rgba(236, 72, 153, 0.22); color: #ec4899; }
 .email-tag-calendar { background: rgba(167, 139, 250, 0.22); color: #a78bfa; }

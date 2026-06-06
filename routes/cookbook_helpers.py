@@ -41,7 +41,7 @@ _GPU_LIST_RE = re.compile(r"^\d+(?:,\d+)*$")
 # A download target directory. Absolute or ~-relative path; safe path glyphs
 # only (no quotes, shell metacharacters, or spaces) since it lands in a shell
 # command. A leading ~ is expanded to $HOME at command-build time.
-_LOCAL_DIR_RE = re.compile(r"^~?/[A-Za-z0-9._/-]*$|^~$")
+_LOCAL_DIR_RE = re.compile(r"^(?:~?/[A-Za-z0-9._/-]*|~|[A-Za-z]:[\\/][A-Za-z0-9._/\\-]*)$")
 _WINDOWS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
@@ -96,7 +96,7 @@ def _validate_local_dir(v: str | None) -> str | None:
         return None
     v = v.rstrip("/") or "/"
     if not _LOCAL_DIR_RE.match(v):
-        raise HTTPException(400, "Invalid local_dir — must be an absolute or ~ path with no spaces or shell metacharacters")
+        raise HTTPException(400, "Invalid local_dir — must be an absolute, Windows drive, or ~ path with no spaces or shell metacharacters")
     return v
 
 

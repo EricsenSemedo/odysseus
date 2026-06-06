@@ -772,49 +772,76 @@ export function _tmuxCmd(task, tmuxArgs) {
   return `tmux ${tmuxArgs} 2>/dev/null`;
 }
 
-function _winSessionCmd(task, tmuxArgs) {
-  const host = task.remoteHost;
-  const sd = host ? '$env:TEMP\\odysseus-sessions' : '$env:TEMP\\odysseus-tmux';
-  const sid = task.sessionId;
+function _psSingleQuoted(value) {
+  return String(value || '').replace(/'/g, "''");
+}
+
+function _psEncodedCommand(script) {
+  // PowerShell -EncodedCommand expects UTF-16LE bytes encoded as base64.
+  const bytes = [];
+  for (let i = 0; i < script.length; i++) {
+    const code = script.charCodeAt(i);
+    bytes.push(String.fromCharCode(code & 0xff));
+    bytes.push(String.fromCharCode((code >> 8) & 0xff));
+  }
+  return btoa(bytes.join(''));
+}
+
+function _winPowerShellCmd(task, script) {
   const pf = _sshPrefix(_getPort(task));
+  if (task.remoteHost) {
+    return `ssh ${pf}${task.remoteHost} powershell -NoProfile -EncodedCommand ${_psEncodedCommand(script)}`;
+  }
+  return `powershell -NoProfile -EncodedCommand ${_psEncodedCommand(script)}`;
+}
+
+function _winSessionCmd(task, tmuxArgs) {
+  const sid = _psSingleQuoted(task.sessionId);
+  const taskName = _psSingleQuoted(`Odysseus-${task.sessionId}`);
   if (tmuxArgs.includes('capture-pane')) {
     const lines = tmuxArgs.match(/-S\s*-?(\d+)/)?.[1] || '200';
-    const ps = host
-      ? `Get-Content '${sd}\\${sid}.log' -Tail ${lines} -ErrorAction SilentlyContinue`
-      : `Get-Content (Join-Path $env:TEMP 'odysseus-tmux\\${sid}.log') -Tail ${lines} -ErrorAction SilentlyContinue`;
-    return host ? `ssh ${pf}${host} "powershell -Command \\"${ps}\\""` : `powershell -Command "${ps}"`;
+    const ps = `Get-Content (Join-Path $env:TEMP 'odysseus-sessions\\${sid}.log') -Tail ${lines} -ErrorAction SilentlyContinue`;
+    return _winPowerShellCmd(task, ps);
   }
   if (tmuxArgs.includes('has-session')) {
-    const ps = host
-      ? `$p = Get-Content '${sd}\\${sid}.pid' -ErrorAction SilentlyContinue; if ($p) { Get-Process -Id $p -ErrorAction SilentlyContinue | Out-Null; if ($?) { exit 0 } else { exit 1 } } else { exit 1 }`
-      : `$p = Get-Content (Join-Path $env:TEMP 'odysseus-tmux\\${sid}.pid') -ErrorAction SilentlyContinue; if ($p) { Get-Process -Id $p -ErrorAction SilentlyContinue | Out-Null; if ($?) { exit 0 } else { exit 1 } } else { exit 1 }`;
-    return host ? `ssh ${pf}${host} "powershell -Command \\"${ps}\\""` : `powershell -Command "${ps}"`;
+    const ps = [
+      `$procId = Get-Content (Join-Path $env:TEMP 'odysseus-sessions\\${sid}.pid') -ErrorAction SilentlyContinue`,
+      `if ($procId) { $proc = Get-Process -Id ([int]$procId) -ErrorAction SilentlyContinue; if ($proc) { exit 0 } }`,
+      `$taskText = schtasks /Query /TN '${taskName}' /V /FO LIST 2>$null | Out-String`,
+      `if ($LASTEXITCODE -eq 0 -and $taskText -match 'Status:\\s+Running') { exit 0 }`,
+      `exit 1`,
+    ].join('; ');
+    return _winPowerShellCmd(task, ps);
   }
   if (tmuxArgs.includes('kill-session')) {
-    const ps = host
-      ? `$p = Get-Content '${sd}\\${sid}.pid' -ErrorAction SilentlyContinue; if ($p) { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue }; Remove-Item '${sd}\\${sid}.*' -Force -ErrorAction SilentlyContinue`
-      : `$p = Get-Content (Join-Path $env:TEMP 'odysseus-tmux\\${sid}.pid') -ErrorAction SilentlyContinue; if ($p) { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue }; Remove-Item (Join-Path $env:TEMP 'odysseus-tmux\\${sid}.*') -Force -ErrorAction SilentlyContinue`;
-    return host ? `ssh ${pf}${host} "powershell -Command \\"${ps}\\""` : `powershell -Command "${ps}"`;
+    const ps = [
+      `$procId = Get-Content (Join-Path $env:TEMP 'odysseus-sessions\\${sid}.pid') -ErrorAction SilentlyContinue`,
+      `if ($procId) { Stop-Process -Id ([int]$procId) -Force -ErrorAction SilentlyContinue }`,
+      `schtasks /End /TN '${taskName}' 2>$null | Out-Null`,
+      `schtasks /Delete /TN '${taskName}' /F 2>$null | Out-Null`,
+      `Remove-Item (Join-Path $env:TEMP 'odysseus-sessions\\${sid}.*') -Force -ErrorAction SilentlyContinue`,
+    ].join('; ');
+    return _winPowerShellCmd(task, ps);
   }
   if (tmuxArgs.includes('send-keys') && tmuxArgs.includes('C-c')) {
-    const ps = host
-      ? `$p = Get-Content '${sd}\\${sid}.pid' -ErrorAction SilentlyContinue; if ($p) { Stop-Process -Id $p -ErrorAction SilentlyContinue }`
-      : `$p = Get-Content (Join-Path $env:TEMP 'odysseus-tmux\\${sid}.pid') -ErrorAction SilentlyContinue; if ($p) { Stop-Process -Id $p -ErrorAction SilentlyContinue }`;
-    return host ? `ssh ${pf}${host} "powershell -Command \\"${ps}\\""` : `powershell -Command "${ps}"`;
+    const ps = `$procId = Get-Content (Join-Path $env:TEMP 'odysseus-sessions\\${sid}.pid') -ErrorAction SilentlyContinue; if ($procId) { Stop-Process -Id ([int]$procId) -ErrorAction SilentlyContinue }`;
+    return _winPowerShellCmd(task, ps);
   }
-  return host ? `ssh ${pf}${host} 'tmux ${tmuxArgs}' 2>/dev/null` : `tmux ${tmuxArgs} 2>/dev/null`;
+  return _winPowerShellCmd(task, `tmux ${tmuxArgs}`);
 }
 
 function _tmuxGracefulKill(task) {
   if (_isWindows(task)) {
-    const host = task.remoteHost;
-    const sd = host ? '$env:TEMP\\odysseus-sessions' : '$env:TEMP\\odysseus-tmux';
-    const sid = task.sessionId;
-    const pf = _sshPrefix(_getPort(task));
-    const ps = host
-      ? `$p = Get-Content '${sd}\\${sid}.pid' -ErrorAction SilentlyContinue; if ($p) { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue }; Remove-Item '${sd}\\${sid}.*' -Force -ErrorAction SilentlyContinue`
-      : `$p = Get-Content (Join-Path $env:TEMP 'odysseus-tmux\\${sid}.pid') -ErrorAction SilentlyContinue; if ($p) { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue }; Remove-Item (Join-Path $env:TEMP 'odysseus-tmux\\${sid}.*') -Force -ErrorAction SilentlyContinue`;
-    return host ? `ssh ${pf}${host} "powershell -Command \\"${ps}\\""` : `powershell -Command "${ps}"`;
+    const sid = _psSingleQuoted(task.sessionId);
+    const taskName = _psSingleQuoted(`Odysseus-${task.sessionId}`);
+    const ps = [
+      `$procId = Get-Content (Join-Path $env:TEMP 'odysseus-sessions\\${sid}.pid') -ErrorAction SilentlyContinue`,
+      `if ($procId) { Stop-Process -Id ([int]$procId) -Force -ErrorAction SilentlyContinue }`,
+      `schtasks /End /TN '${taskName}' 2>$null | Out-Null`,
+      `schtasks /Delete /TN '${taskName}' /F 2>$null | Out-Null`,
+      `Remove-Item (Join-Path $env:TEMP 'odysseus-sessions\\${sid}.*') -Force -ErrorAction SilentlyContinue`,
+    ].join('; ');
+    return _winPowerShellCmd(task, ps);
   }
   if (task.remoteHost) {
     return `ssh ${_sshPrefix(_getPort(task))}${task.remoteHost} 'tmux send-keys -t ${task.sessionId} C-c 2>/dev/null; sleep 2; tmux kill-session -t ${task.sessionId} 2>/dev/null'`;

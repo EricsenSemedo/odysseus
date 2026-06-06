@@ -19,11 +19,17 @@ class _FakeColumn:
     def __eq__(self, value):
         return ("eq", self.name, value)
 
+    def __or__(self, other):
+        return ("or", self, other)
+
 
 class _FakeModelEndpoint:
     id = _FakeColumn("id")
     is_enabled = _FakeColumn("is_enabled")
     owner = _FakeColumn("owner")
+
+
+_FakeEndpointModel = _FakeModelEndpoint
 
 
 class _FakeDbSession:
@@ -39,7 +45,14 @@ class _FakeQuery:
         for condition in conditions:
             if isinstance(condition, tuple) and condition[0] == "eq":
                 _, field, value = condition
-                self.rows = [row for row in self.rows if getattr(row, field) == value]
+                self.rows = [row for row in self.rows if getattr(row, field, None) == value]
+            elif isinstance(condition, tuple) and condition[0] == "or":
+                _, left, right = condition
+                accepted = []
+                for row in self.rows:
+                    if _condition_matches(row, left) or _condition_matches(row, right):
+                        accepted.append(row)
+                self.rows = accepted
         return self
 
     def first(self):
@@ -47,6 +60,13 @@ class _FakeQuery:
 
     def all(self):
         return list(self.rows)
+
+
+def _condition_matches(row, condition):
+    if isinstance(condition, tuple) and condition[0] == "eq":
+        _, field, value = condition
+        return getattr(row, field, None) == value
+    return False
 
 
 class _FakeDb:
@@ -60,6 +80,26 @@ class _FakeDb:
         pass
 
 
+class _FakeDbRouter:
+    def __init__(self, rows_by_model):
+        self.rows_by_model = rows_by_model
+        self.committed = False
+
+    def query(self, model):
+        return _FakeQuery(self.rows_by_model.get(model, []))
+
+    def commit(self):
+        self.committed = True
+
+    def close(self):
+        pass
+
+
+class _FakeOwnedSessionModel:
+    id = _FakeColumn("id")
+    owner = _FakeColumn("owner")
+
+
 def _default_chat_endpoint():
     from routes.model_routes import setup_model_routes
 
@@ -68,6 +108,17 @@ def _default_chat_endpoint():
         if getattr(route, "path", "") == "/api/default-chat":
             return route.endpoint
     raise AssertionError("/api/default-chat route not found")
+
+
+def _session_route(path: str, method: str, manager):
+    import routes.session_routes as session_routes
+
+    router = session_routes.setup_session_routes(manager, {"REQUEST_TIMEOUT": 1})
+    for route in reversed(router.routes):
+        methods = getattr(route, "methods", set()) or set()
+        if getattr(route, "path", "") == path and method in methods:
+            return route.endpoint
+    raise AssertionError(f"{method} {path} route not found")
 
 
 def _install_model_route_import_stubs(monkeypatch):
@@ -671,3 +722,192 @@ def test_visible_models_empty_cached_returns_empty(monkeypatch):
 
     result = _visible_models([], None)
     assert result == []
+
+
+def test_create_session_prefers_endpoint_id_over_stale_endpoint_url(monkeypatch):
+    import core.database as core_db
+    import routes.session_routes as session_routes
+
+    endpoint_row = SimpleNamespace(
+        id="ep1",
+        base_url="http://127.0.0.1:11434/v1",
+        api_key=None,
+        owner="jam",
+        is_enabled=True,
+    )
+    db = _FakeDbRouter({_FakeEndpointModel: [endpoint_row]})
+
+    class _Mgr:
+        def __init__(self):
+            self.created = None
+
+        def create_session(self, **kwargs):
+            self.created = SimpleNamespace(**kwargs, headers={})
+            return self.created
+
+        def save_sessions(self):
+            pass
+
+    mgr = _Mgr()
+    monkeypatch.setattr(session_routes, "SessionLocal", lambda: db)
+    monkeypatch.setattr(core_db, "ModelEndpoint", _FakeEndpointModel)
+    monkeypatch.setattr(session_routes, "get_current_user", lambda request: "jam")
+    monkeypatch.setattr(session_routes, "effective_user", lambda request: "jam")
+    monkeypatch.setattr("src.auth_helpers.owner_filter", lambda q, m, u, **kw: q.filter(m.owner == u))
+
+    endpoint = _session_route("/api/session", "POST", mgr)
+    endpoint(
+        SimpleNamespace(),
+        name="test",
+        endpoint_url="http://ollama:11434/v1/chat/completions",
+        model="qwen3-vl:8b-instruct",
+        skip_validation="true",
+        api_key="",
+        endpoint_id="ep1",
+    )
+
+    assert mgr.created.endpoint_url == "http://127.0.0.1:11434/api/chat"
+
+
+def test_rename_session_prefers_endpoint_id_over_stale_endpoint_url(monkeypatch):
+    import core.database as core_db
+    import routes.session_routes as session_routes
+
+    endpoint_row = SimpleNamespace(
+        id="ep1",
+        base_url="http://127.0.0.1:11434/v1",
+        api_key=None,
+        owner="jam",
+        is_enabled=True,
+    )
+    db_session_row = SimpleNamespace(
+        id="sess-1",
+        endpoint_url="http://ollama:11434/v1/chat/completions",
+        model="old-model",
+        updated_at=None,
+    )
+    db = _FakeDbRouter({
+        _FakeEndpointModel: [endpoint_row],
+        _FakeOwnedSessionModel: [db_session_row],
+    })
+    live_session = SimpleNamespace(
+        model="old-model",
+        endpoint_url="http://ollama:11434/v1/chat/completions",
+        headers={"Authorization": "Bearer old-token"},
+    )
+
+    class _Mgr:
+        def get_session(self, sid):
+            assert sid == "sess-1"
+            return live_session
+
+        def save_sessions(self):
+            pass
+
+    monkeypatch.setattr(session_routes, "SessionLocal", lambda: db)
+    monkeypatch.setattr(core_db, "ModelEndpoint", _FakeEndpointModel)
+    monkeypatch.setattr(session_routes, "DbSession", _FakeOwnedSessionModel)
+    monkeypatch.setattr(session_routes, "_verify_session_owner", lambda request, sid: None)
+    monkeypatch.setattr(session_routes, "get_current_user", lambda request: "jam")
+    monkeypatch.setattr("src.auth_helpers.owner_filter", lambda q, m, u, **kw: q.filter(m.owner == u))
+
+    endpoint = _session_route("/api/session/{sid}", "PATCH", _Mgr())
+    result = endpoint(
+        SimpleNamespace(),
+        "sess-1",
+        name=None,
+        folder=None,
+        model="qwen3-vl:8b-instruct",
+        endpoint_url="http://ollama:11434/v1/chat/completions",
+        endpoint_id="ep1",
+    )
+
+    assert live_session.endpoint_url == "http://127.0.0.1:11434/api/chat"
+    assert db_session_row.endpoint_url == "http://127.0.0.1:11434/api/chat"
+    assert result["endpoint_url"] == "http://127.0.0.1:11434/api/chat"
+    assert live_session.headers == {}
+
+
+def test_create_session_rejects_endpoint_id_owned_by_other_user(monkeypatch):
+    import core.database as core_db
+    import routes.session_routes as session_routes
+
+    endpoint_row = SimpleNamespace(
+        id="ep1",
+        base_url="http://127.0.0.1:11434/v1",
+        api_key="secret",
+        owner="other",
+        is_enabled=True,
+    )
+    db = _FakeDbRouter({_FakeEndpointModel: [endpoint_row]})
+
+    class _Mgr:
+        def create_session(self, **kwargs):
+            raise AssertionError("session should not be created")
+
+    monkeypatch.setattr(session_routes, "SessionLocal", lambda: db)
+    monkeypatch.setattr(core_db, "ModelEndpoint", _FakeEndpointModel)
+    monkeypatch.setattr(session_routes, "get_current_user", lambda request: "jam")
+    monkeypatch.setattr("src.auth_helpers.owner_filter", lambda q, m, u, **kw: q.filter(m.owner == u))
+
+    endpoint = _session_route("/api/session", "POST", _Mgr())
+    with pytest.raises(Exception) as exc:
+        endpoint(
+            SimpleNamespace(),
+            name="test",
+            endpoint_url="http://ollama:11434/v1/chat/completions",
+            model="qwen3-vl:8b-instruct",
+            skip_validation="true",
+            api_key="",
+            endpoint_id="ep1",
+        )
+
+    assert getattr(exc.value, "status_code", None) == 400
+
+
+def test_create_session_validates_against_resolved_endpoint_url(monkeypatch):
+    import core.database as core_db
+    import routes.session_routes as session_routes
+    import src.llm_core as llm_core
+
+    endpoint_row = SimpleNamespace(
+        id="ep1",
+        base_url="http://127.0.0.1:11434/v1",
+        api_key=None,
+        owner="jam",
+        is_enabled=True,
+    )
+    db = _FakeDbRouter({_FakeEndpointModel: [endpoint_row]})
+    seen = {}
+
+    class _Mgr:
+        def create_session(self, **kwargs):
+            self.created = SimpleNamespace(**kwargs, headers={})
+            return self.created
+
+        def save_sessions(self):
+            pass
+
+    def fake_list_model_ids(endpoint_url, **kwargs):
+        seen["endpoint_url"] = endpoint_url
+        return ["qwen3-vl:8b-instruct"]
+
+    monkeypatch.setattr(session_routes, "SessionLocal", lambda: db)
+    monkeypatch.setattr(core_db, "ModelEndpoint", _FakeEndpointModel)
+    monkeypatch.setattr(session_routes, "get_current_user", lambda request: "jam")
+    monkeypatch.setattr(session_routes, "effective_user", lambda request: "jam")
+    monkeypatch.setattr(llm_core, "list_model_ids", fake_list_model_ids)
+    monkeypatch.setattr("src.auth_helpers.owner_filter", lambda q, m, u, **kw: q.filter(m.owner == u))
+
+    endpoint = _session_route("/api/session", "POST", _Mgr())
+    endpoint(
+        SimpleNamespace(),
+        name="test",
+        endpoint_url="http://ollama:11434/v1/chat/completions",
+        model="qwen3-vl:8b-instruct",
+        skip_validation=None,
+        api_key="",
+        endpoint_id="ep1",
+    )
+
+    assert seen["endpoint_url"] == "http://127.0.0.1:11434/api/chat"

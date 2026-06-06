@@ -2192,6 +2192,341 @@ async def action_cookbook_serve(
     return f"Launched {repo_id} (session {sid})", True
 
 
+async def action_backfill_email_job_tags(owner: str, **kwargs) -> Tuple[str, bool]:
+    """Walk historical inbox/archive mail in batches and tag job-application emails.
+
+    Designed as a resumable manual task: each run advances a per-owner cursor
+    across INBOX plus the account's archive/all-mail folder (if present), skips
+    messages already tagged, and defers itself until the backlog is exhausted.
+    """
+    try:
+        import asyncio as _aio
+        import json as _json
+        import os as _os
+        import sqlite3 as _sql3
+        from datetime import datetime as _dt
+        from pathlib import Path as _P
+
+        from core.database import SessionLocal as _SL, EmailAccount as _EA
+        from routes.email_helpers import (
+            SCHEDULED_DB,
+            _decode_header,
+            _imap_connect,
+            _init_scheduled_db,
+            _q,
+            classify_job_application_stage,
+            looks_like_job_application_email,
+            normalize_email_tag,
+        )
+        from sqlalchemy import and_ as _and, or_ as _or
+        from src.endpoint_resolver import resolve_endpoint, resolve_utility_fallback_candidates
+        from src.llm_core import llm_call_async_with_fallback
+
+        _owner_slug = "".join(c if (c.isalnum() or c in "-_.@") else "_" for c in (owner or "default"))
+        state_path = _P(f"data/email_job_tag_backfill_{_owner_slug}.json")
+        batch_size = 80
+        processed = 0
+        tagged = 0
+        skipped_existing = 0
+        skipped_non_candidates = 0
+        folder_progress = []
+
+        url, model, headers = resolve_endpoint("utility")
+        if not url or not model:
+            url, model, headers = resolve_endpoint("default")
+        if not url or not model:
+            return "No LLM endpoint available", False
+        candidates = [(url, model, headers)] + resolve_utility_fallback_candidates()
+
+        db = _SL()
+        try:
+            q = db.query(_EA).filter(_EA.enabled == True)  # noqa: E712
+            if owner:
+                unowned = _or(_EA.owner == None, _EA.owner == "")  # noqa: E711
+                same_mailbox = _or(_EA.imap_user == owner, _EA.from_address == owner)
+                q = q.filter(_or(_EA.owner == owner, _and(unowned, same_mailbox)))
+            accounts = q.all()
+        finally:
+            db.close()
+        if not accounts:
+            raise TaskNoop("no email accounts configured")
+
+        try:
+            state = _json.loads(state_path.read_text()) if state_path.exists() else {}
+        except Exception:
+            state = {}
+        state.setdefault("accounts", {})
+
+        _init_scheduled_db()
+
+        def _folders_for_account(account_id: str) -> list[str]:
+            conn = _imap_connect(account_id)
+            try:
+                status, folders = conn.list()
+                names = ["INBOX"]
+                if status == "OK" and folders:
+                    parsed = []
+                    for f in folders:
+                        decoded = f.decode() if isinstance(f, bytes) else str(f)
+                        import re as _re
+                        m = _re.search(r'"([^"]*)"\s*$|(\S+)\s*$', decoded)
+                        if m:
+                            parsed.append(m.group(1) or m.group(2))
+                    for name in parsed:
+                        low = (name or "").lower()
+                        if low == "inbox":
+                            continue
+                        if "all mail" in low or "archive" in low:
+                            names.append(name)
+                            break
+                return names
+            finally:
+                try:
+                    conn.logout()
+                except Exception:
+                    pass
+
+        def _fetch_batch(account_id: str, folder: str, offset: int) -> tuple[list[dict], int]:
+            import email as _email_mod
+            conn = _imap_connect(account_id)
+            try:
+                st_sel, _ = conn.select(_q(folder), readonly=True)
+                if st_sel != "OK":
+                    return [], 0
+                st, data = conn.uid("search", None, "ALL")
+                if st != "OK" or not data or not data[0]:
+                    return [], 0
+                uid_list = data[0].split()
+                total = len(uid_list)
+                batch = uid_list[offset:offset + batch_size]
+                rows = []
+                for uid_b in batch:
+                    try:
+                        uid = uid_b.decode() if isinstance(uid_b, bytes) else str(uid_b)
+                        # IMAP FETCH expects message sequence numbers, not UIDs.
+                        # Use UID FETCH here or historical scans can see the
+                        # folder size but return zero rows for every batch.
+                        fetch_st, msg_data = conn.uid("fetch", uid, "(RFC822)")
+                        if fetch_st != "OK" or not msg_data:
+                            continue
+                        raw = b""
+                        for part in msg_data:
+                            if isinstance(part, tuple) and part[1]:
+                                raw += part[1] + b"\n\n"
+                        if not raw:
+                            continue
+                        msg = _email_mod.message_from_bytes(raw)
+                        subject = _decode_header(msg.get("Subject") or "")
+                        from_raw = _decode_header(msg.get("From") or "")
+                        body_snippet = ""
+                        try:
+                            if msg.is_multipart():
+                                for part in msg.walk():
+                                    if part.get_content_type() == "text/plain":
+                                        body_snippet = part.get_payload(decode=True).decode("utf-8", errors="ignore")[:2000]
+                                        break
+                            else:
+                                body_snippet = (msg.get_payload(decode=True) or b"").decode("utf-8", errors="ignore")[:2000]
+                        except Exception:
+                            body_snippet = ""
+                        rows.append({
+                            "uid": uid,
+                            "folder": folder,
+                            "subject": subject,
+                            "from": from_raw,
+                            "body": body_snippet.strip(),
+                            "message_id": (msg.get("Message-ID") or "").strip(),
+                        })
+                    except Exception:
+                        continue
+                return rows, total
+            finally:
+                try:
+                    conn.logout()
+                except Exception:
+                    pass
+
+        def _existing_job_tags(message_id: str, owner_key: str) -> set[str]:
+            if not message_id:
+                return set()
+            conn = _sql3.connect(SCHEDULED_DB)
+            try:
+                row = conn.execute(
+                    "SELECT tags FROM email_tags WHERE message_id=? AND owner=?",
+                    (message_id, owner_key),
+                ).fetchone()
+                if not row:
+                    return set()
+                try:
+                    tags = _json.loads(row[0] or "[]")
+                except Exception:
+                    tags = []
+                return {normalize_email_tag(t) for t in tags}
+            finally:
+                conn.close()
+
+        def _write_tag(item: dict, owner_key: str, reason: str, stage_tag: str | None = None) -> None:
+            conn = _sql3.connect(SCHEDULED_DB)
+            try:
+                row = conn.execute(
+                    "SELECT tags, spam_verdict FROM email_tags WHERE message_id=? AND owner=?",
+                    (item["message_id"], owner_key),
+                ).fetchone()
+                tags = []
+                spam = 0
+                if row:
+                    try:
+                        tags = [normalize_email_tag(t) for t in _json.loads(row[0] or "[]")]
+                    except Exception:
+                        tags = []
+                    spam = int(row[1] or 0)
+                if "job-applications" not in tags:
+                    tags.append("job-applications")
+                if stage_tag and stage_tag not in tags:
+                    tags.append(stage_tag)
+                # Keep umbrella plus one stage tag for job mail.
+                if stage_tag:
+                    tags = [t for t in tags if t == "job-applications" or not t.startswith("job-") or t == stage_tag]
+                if row:
+                    conn.execute(
+                        "UPDATE email_tags SET uid=?, folder=?, subject=?, sender=?, tags=?, spam_verdict=?, spam_reason=? "
+                        "WHERE message_id=? AND owner=?",
+                        (
+                            item["uid"], item["folder"], item["subject"], item["from"],
+                            _json.dumps(tags), spam, reason[:200], item["message_id"], owner_key,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO email_tags "
+                        "(message_id, owner, uid, folder, subject, sender, tags, spam_verdict, spam_reason, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                        (
+                            item["message_id"], owner_key, item["uid"], item["folder"], item["subject"],
+                            item["from"], _json.dumps(tags), reason[:200], _dt.utcnow().isoformat(),
+                        ),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+        owner_key = owner or ""
+
+        for acc in accounts:
+            acc_state = state["accounts"].setdefault(acc.id, {})
+            folders = await _aio.to_thread(_folders_for_account, acc.id)
+            for folder in folders:
+                f_state = acc_state.setdefault(folder, {"offset": 0, "done": False})
+                if f_state.get("done"):
+                    continue
+                items, total = await _aio.to_thread(_fetch_batch, acc.id, folder, int(f_state.get("offset", 0) or 0))
+                if total == 0:
+                    f_state["done"] = True
+                    folder_progress.append(f"{acc.name or acc.imap_user}:{folder} empty")
+                    continue
+                # Advance by the attempted batch size, not the successfully
+                # parsed row count, so one malformed message cannot stall the
+                # resumable cursor forever at the same offset.
+                attempted = min(batch_size, max(total - int(f_state.get("offset", 0) or 0), 0))
+                next_offset = int(f_state.get("offset", 0) or 0) + attempted
+                for item in items:
+                    processed += 1
+                    if not item.get("message_id"):
+                        continue
+                    existing_tags = _existing_job_tags(item["message_id"], owner_key)
+                    existing_stage = next((t for t in existing_tags if t.startswith("job-") and t != "job-applications"), None)
+                    if "job-applications" in existing_tags and existing_stage:
+                        skipped_existing += 1
+                        continue
+                    if not looks_like_job_application_email(item["subject"], item["from"], item["body"]):
+                        skipped_non_candidates += 1
+                        continue
+                    prompt = (
+                        "You are checking whether ONE email is about the user's job applications. "
+                        "Return ONLY JSON: {\"match\":true|false,\"stage\":\"job-recruiter|job-application-update|"
+                        "job-interview|job-assessment|job-rejection|job-offer|\",\"reason\":\"short phrase\"}. "
+                        "match=true for recruiter outreach, application confirmations, interview scheduling, "
+                        "coding assessments, rejections, offers, or status updates for roles the user applied to.\n\n"
+                        f"From: {item['from']}\nSubject: {item['subject']}\nSnippet:\n{item['body']}"
+                    )
+                    try:
+                        raw = await llm_call_async_with_fallback(
+                            candidates,
+                            [{"role": "user", "content": prompt}],
+                            temperature=0.0,
+                            max_tokens=120,
+                            timeout=30,
+                        )
+                        txt = (raw or "").strip()
+                        if txt.startswith("```"):
+                            txt = txt.strip("`")
+                            nl = txt.find("\n")
+                            if nl >= 0:
+                                txt = txt[nl + 1:]
+                        s = txt.find("{")
+                        e = txt.rfind("}")
+                        if s < 0 or e <= s:
+                            continue
+                        obj = _json.loads(txt[s:e + 1])
+                        if bool(obj.get("match")):
+                            _stage = normalize_email_tag(obj.get("stage") or "")
+                            if not _stage.startswith("job-") or _stage == "job-applications":
+                                _stage = classify_job_application_stage(item["subject"], item["from"], item["body"])
+                            if not _stage:
+                                _stage = existing_stage
+                            _write_tag(item, owner_key, str(obj.get("reason") or "job application email"), _stage or None)
+                            tagged += 1
+                    except Exception as e:
+                        logger.debug("email job backfill classify failed for %s %s: %s", folder, item["uid"], e)
+                        continue
+                f_state["offset"] = next_offset
+                if next_offset >= total:
+                    f_state["done"] = True
+                    folder_progress.append(f"{acc.name or acc.imap_user}:{folder} done ({total} scanned)")
+                else:
+                    folder_progress.append(f"{acc.name or acc.imap_user}:{folder} {next_offset}/{total}")
+                    try:
+                        state_path.write_text(_json.dumps(state))
+                    except Exception:
+                        pass
+                    raise TaskDeferred(
+                        f"Email job backfill in progress ({acc.name or acc.imap_user} {folder} {next_offset}/{total})",
+                        delay_seconds=15,
+                        escalate_delay=False,
+                    )
+
+        if all(
+            fstate.get("done")
+            for acc_state in state.get("accounts", {}).values()
+            for fstate in acc_state.values()
+        ):
+            try:
+                state_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        else:
+            try:
+                state_path.write_text(_json.dumps(state))
+            except Exception:
+                pass
+
+        summary = (
+            f"Historical email job backfill finished: scanned {processed}, "
+            f"tagged {tagged}, skipped existing {skipped_existing}, "
+            f"skipped non-candidates {skipped_non_candidates}."
+        )
+        if folder_progress:
+            summary += " " + " | ".join(folder_progress[:6])
+        return summary, True
+    except TaskDeferred:
+        raise
+    except TaskNoop:
+        raise
+    except Exception as e:
+        logger.exception("backfill_email_job_tags action failed")
+        return str(e), False
+
+
 BUILTIN_ACTIONS = {
     "tidy_sessions": action_tidy_sessions,
     "tidy_documents": action_tidy_documents,
@@ -2212,6 +2547,7 @@ BUILTIN_ACTIONS = {
     "audit_skills": action_audit_skills,
     "check_email_urgency": action_check_email_urgency,
     "cookbook_serve": action_cookbook_serve,
+    "backfill_email_job_tags": action_backfill_email_job_tags,
     # ping_notes removed from the registry — runs only inside `_note_pings_loop`.
 }
 

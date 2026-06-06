@@ -31,10 +31,10 @@ def test_background_status_poll_reconciles_into_local_tasks():
 def test_local_windows_session_commands_use_local_powershell_log_dir():
     source = _read("static/js/cookbookRunning.js")
 
-    assert "const host = task.remoteHost;" in source
-    assert "host ? '$env:TEMP\\\\odysseus-sessions' : '$env:TEMP\\\\odysseus-tmux'" in source
-    assert "return host ? `ssh ${pf}${host}" in source
-    assert ": `powershell -Command \"${ps}\"`;" in source
+    assert "function _psEncodedCommand(script) {" in source
+    assert "powershell -NoProfile -EncodedCommand" in source
+    assert "if (task.remoteHost) {" in source
+    assert "odysseus-sessions\\\\${sid}.log" in source
 
 
 def test_dep_install_success_recognized_from_exit_sentinel():

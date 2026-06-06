@@ -213,6 +213,36 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
     REQUEST_TIMEOUT = config.get("REQUEST_TIMEOUT", 20)
     OPENAI_API_KEY = config.get("OPENAI_API_KEY")
     SESSIONS_FILE = config.get("SESSIONS_FILE")
+
+    def _resolve_endpoint_selection(endpoint_url: str, endpoint_id: str, owner: str | None):
+        """Resolve the caller's endpoint selection to the current endpoint row.
+
+        When an endpoint_id is present, trust the DB row over any stale URL the
+        browser may still be holding from an older model list.
+        """
+        final_url = endpoint_url or ""
+        resolved_base = endpoint_url or ""
+        endpoint_api_key = None
+        resolved_endpoint = False
+        if endpoint_id and endpoint_id.strip():
+            from core.database import ModelEndpoint
+            from src.endpoint_resolver import normalize_base, build_chat_url
+            from src.auth_helpers import owner_filter
+
+            _db = SessionLocal()
+            try:
+                q = _db.query(ModelEndpoint).filter(ModelEndpoint.id == endpoint_id.strip())
+                q = owner_filter(q, ModelEndpoint, owner or "")
+                ep = q.first()
+                if not ep:
+                    raise HTTPException(400, "Model endpoint no longer exists")
+                resolved_base = ep.base_url or ""
+                endpoint_api_key = ep.api_key
+                resolved_endpoint = True
+            finally:
+                _db.close()
+            final_url = build_chat_url(normalize_base(resolved_base)) if resolved_base else (endpoint_url or "")
+        return final_url, resolved_base, endpoint_api_key, resolved_endpoint
     
     @router.get("/sessions")
     def list_sessions(request: Request):
@@ -354,6 +384,11 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         if not endpoint_url and not skip_val:
             raise HTTPException(400, "endpoint_url is required (choose from /api/models)")
 
+        user = get_current_user(request)
+        final_endpoint_url, resolved_base, endpoint_api_key, _resolved_endpoint = _resolve_endpoint_selection(endpoint_url, endpoint_id, user)
+        validation_endpoint_url = final_endpoint_url or endpoint_url
+        validation_key = (api_key or "").strip() or endpoint_api_key or ""
+        validation_headers = {"Authorization": f"Bearer {validation_key}"} if validation_key else None
         model_to_use = model
         request_api_key = api_key.strip() if api_key else ""
         effective_api_key = request_api_key or endpoint_api_key
@@ -370,7 +405,7 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
             pass
         elif not model_to_use:
             from src.llm_core import list_model_ids
-            ids = list_model_ids(endpoint_url, timeout=REQUEST_TIMEOUT,
+            ids = list_model_ids(validation_endpoint_url, timeout=REQUEST_TIMEOUT,
                                  headers=validation_headers)
             if not ids:
                 raise HTTPException(400, "Cannot reach /v1/models")
@@ -385,7 +420,7 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
             from src.llm_core import list_model_ids
             import os as _os
             req_base = _os.path.basename(model_to_use.rstrip("/"))
-            avail = list_model_ids(endpoint_url, timeout=REQUEST_TIMEOUT,
+            avail = list_model_ids(validation_endpoint_url, timeout=REQUEST_TIMEOUT,
                                    headers=validation_headers)
             if not avail:
                 raise HTTPException(400, "Cannot reach /v1/models")
@@ -405,7 +440,7 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         session = session_manager.create_session(
             session_id=sid,
             name=name or "",
-            endpoint_url=endpoint_url or "",
+            endpoint_url=final_endpoint_url,
             model=model_to_use,
             rag=str(rag).lower() == "true" if rag else False,
             owner=user,
@@ -466,36 +501,15 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         # Switch model/endpoint mid-session
         if model is not None and endpoint_url is not None:
             user = get_current_user(request)
-            _reject_raw_endpoint_url_for_non_admin(request, user, endpoint_id, endpoint_url)
-            endpoint_api_key = ""
-            endpoint_base_url = ""
-            if endpoint_id:
-                from core.database import ModelEndpoint
-                from src.auth_helpers import owner_filter
-                from src.endpoint_resolver import build_chat_url, normalize_base
-                _db = SessionLocal()
-                try:
-                    q = _db.query(ModelEndpoint).filter(
-                        ModelEndpoint.id == endpoint_id,
-                        ModelEndpoint.is_enabled == True,
-                    )
-                    if user:
-                        q = owner_filter(q, ModelEndpoint, user)
-                    ep = q.first()
-                    if not ep:
-                        raise HTTPException(400, "Model endpoint no longer exists")
-                    endpoint_base_url = ep.base_url or ""
-                    endpoint_api_key = ep.api_key or ""
-                    endpoint_url = build_chat_url(normalize_base(endpoint_base_url))
-                finally:
-                    _db.close()
+            previous_endpoint_url = session.endpoint_url
+            final_endpoint_url, resolved_base, endpoint_api_key, resolved_endpoint = _resolve_endpoint_selection(endpoint_url, endpoint_id or "", user)
             session.model = model
-            session.endpoint_url = endpoint_url
+            session.endpoint_url = final_endpoint_url
             # Update auth headers from the endpoint's stored API key
             if endpoint_api_key:
                 from src.endpoint_resolver import build_headers
-                session.headers = build_headers(endpoint_api_key, endpoint_base_url)
-            else:
+                session.headers = build_headers(endpoint_api_key, resolved_base)
+            elif resolved_endpoint or final_endpoint_url != previous_endpoint_url:
                 session.headers = {}
             # Persist to DB
             db = SessionLocal()
@@ -503,14 +517,15 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
                 db_session = db.query(DbSession).filter(DbSession.id == sid).first()
                 if db_session:
                     db_session.model = model
-                    db_session.endpoint_url = endpoint_url
+                    db_session.endpoint_url = final_endpoint_url
                     db_session.headers = session.headers or {}
                     db_session.updated_at = datetime.utcnow()
                     db.commit()
             finally:
                 db.close()
+            session_manager.save_sessions()
             result["model"] = model
-            result["endpoint_url"] = endpoint_url
+            result["endpoint_url"] = final_endpoint_url
         return result
     
     @router.post("/session/{sid}/inject_messages")

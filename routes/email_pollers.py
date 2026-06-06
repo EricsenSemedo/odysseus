@@ -832,7 +832,12 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                             "Classify the email. Return ONLY a JSON object, no prose, no markdown fences. "
                             "Schema: {\"tags\": [\"tag1\"], \"spam\": false, \"reason\": \"short\"}. "
                             "Pick 1-2 tags from: work, personal, finance, bills, receipt, travel, "
-                            "newsletter, promo, notification, security, social, shopping, calendar.\n\n"
+                            "newsletter, promo, notification, security, social, shopping, calendar, "
+                            "job-applications, job-recruiter, job-application-update, job-interview, "
+                            "job-assessment, job-rejection, job-offer.\n\n"
+                            "For job-related mail, ALWAYS include job-applications plus ONE more specific "
+                            "job tag when clear: job-recruiter, job-application-update, job-interview, "
+                            "job-assessment, job-rejection, or job-offer.\n\n"
                             "Set spam=true for ANY of:\n"
                             "- Phishing, scams, chain mail, deceptive offers\n"
                             "- Marketing/promotional blasts (\"special offer\", \"limited time\", discount codes)\n"
@@ -883,15 +888,53 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                                 except Exception:
                                     parsed = None
                             if parsed is not None:
-                                _ALLOWED_TAGS = {"work","personal","finance","bills","receipt","travel",
-                                                 "newsletter","marketing","notification","security","social",
-                                                 "shopping","calendar"}
+                                from routes.email_helpers import (
+                                    EMAIL_CATEGORY_TAGS,
+                                    classify_job_application_stage,
+                                    EMAIL_MANAGED_TAGS,
+                                    normalize_email_tag,
+                                    looks_like_job_application_email,
+                                )
                                 raw_tags = parsed.get("tags") or []
                                 if isinstance(raw_tags, str):
                                     raw_tags = [raw_tags]
-                                tags = [t.strip().lower().replace("_", "-") for t in raw_tags if isinstance(t, str)]
-                                tags = ["marketing" if t == "promo" else t for t in tags]
-                                tags = [t for t in tags if t in _ALLOWED_TAGS][:2]
+                                tags = []
+                                for raw_tag in raw_tags:
+                                    if not isinstance(raw_tag, str):
+                                        continue
+                                    tag = normalize_email_tag(raw_tag)
+                                    if tag in EMAIL_CATEGORY_TAGS and tag not in tags:
+                                        tags.append(tag)
+                                _heuristic_jobish = looks_like_job_application_email(subject, sender, body[:4000])
+                                _job_stage = classify_job_application_stage(subject, sender, body[:4000]) if _heuristic_jobish else None
+                                _llm_job_stage = next(
+                                    (
+                                        t for t in tags
+                                        if t in {
+                                            "job-recruiter",
+                                            "job-application-update",
+                                            "job-interview",
+                                            "job-assessment",
+                                            "job-rejection",
+                                            "job-offer",
+                                        }
+                                    ),
+                                    None,
+                                )
+                                _jobish = _heuristic_jobish or _llm_job_stage is not None or "job-applications" in tags
+                                _final_job_stage = _job_stage or _llm_job_stage
+                                if _jobish and "job-applications" not in tags:
+                                    tags.insert(0, "job-applications")
+                                if _final_job_stage and _final_job_stage not in tags:
+                                    tags.append(_final_job_stage)
+                                # Keep umbrella + one specific job tag, or up to 2 generic tags.
+                                if "job-applications" in tags:
+                                    if _final_job_stage:
+                                        tags = ["job-applications", _final_job_stage]
+                                    else:
+                                        tags = ["job-applications"]
+                                else:
+                                    tags = tags[:2]
                                 is_spam = bool(parsed.get("spam"))
                                 spam_reason = str(parsed.get("reason") or "")[:200]
 

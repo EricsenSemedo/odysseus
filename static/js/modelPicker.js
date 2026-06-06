@@ -91,6 +91,30 @@ function _modelExists(modelId, url) {
   });
 }
 
+async function _warmOnSelect(m) {
+  if (!m || !m.endpointId || !m.mid) return;
+  try {
+    const statusRes = await fetch(`${API_BASE}/api/model-endpoints/${m.endpointId}/runtime?model=${encodeURIComponent(m.mid)}`, { credentials: 'same-origin' });
+    if (!statusRes.ok) return;
+    const status = await statusRes.json();
+    if (!status.supported || status.settings?.warm_on_select === false) return;
+    await fetch(`${API_BASE}/api/model-endpoints/${m.endpointId}/runtime/warm`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: m.mid,
+        gpu_layers: status.settings?.gpu_layers ?? 'auto',
+        keep_alive: status.settings?.keep_alive || '30m',
+        warm_on_select: true,
+      }),
+    });
+  } catch (_) {
+    // Warming is opportunistic; picking the model should never fail because
+    // a local runtime endpoint is unavailable or the user lacks admin rights.
+  }
+}
+
 /**
  * Initialize the model picker dropdown.
  * @param {Object} deps
@@ -480,6 +504,7 @@ function _initModelPickerDropdown() {
   async function _pick(m) {
     const currentSessionId = _deps.getCurrentSessionId();
     const _pendingChat = _deps.getPendingChat();
+    _warmOnSelect(m);
 
     // Remember this pick so it surfaces under "Recent" next time the picker
     // opens — the whole point of quick-switch.
@@ -516,12 +541,24 @@ function _initModelPickerDropdown() {
       try {
         const res = await fetch(`${API_BASE}/api/session/${currentSessionId}`, { method: 'PATCH', body: fd });
         if (!res.ok) {
-          uiModule.showError('Failed to set model');
+          let detail = '';
+          try {
+            const bodyText = await res.clone().text();
+            const payload = JSON.parse(bodyText);
+            detail = payload.detail || payload.error || payload.message || JSON.stringify(payload);
+          } catch {
+            try { detail = await res.text(); } catch {}
+          }
+          uiModule.showError(`Failed to set model (${res.status})${detail ? ': ' + detail : ''}`);
           return;
         }
+        const payload = await res.json().catch(() => ({}));
         const sessions = _deps.getSessions();
         const s = sessions.find(x => x.id === currentSessionId);
-        if (s) { s.model = m.mid; s.endpoint_url = m.url; }
+        if (s) {
+          s.model = payload.model || m.mid;
+          s.endpoint_url = payload.endpoint_url || m.url;
+        }
         // Header stays as session name — model info shown in picker only
       } catch (e) {
         uiModule.showError('Failed to set model: ' + e);

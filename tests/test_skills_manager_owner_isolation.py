@@ -42,6 +42,10 @@ for _mod in ("sqlalchemy", "sqlalchemy.orm", "sqlalchemy.ext", "sqlalchemy.ext.d
 from services.memory.skills import SkillsManager  # noqa: E402
 from services.memory.skill_format import Skill, slugify  # noqa: E402
 
+_atomic_io_mod = sys.modules.get("core.atomic_io")
+if _atomic_io_mod is not None and not getattr(_atomic_io_mod, "__file__", None):
+    sys.modules.pop("core.atomic_io", None)
+
 
 def _write_skill_md(skills_root: Path, category: str, name: str,
                     owner: str, description: str) -> Path:

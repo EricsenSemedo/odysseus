@@ -27,6 +27,14 @@ from src.context_compactor import (
     trim_for_context,
 )
 
+for mod in [
+    'sqlalchemy', 'sqlalchemy.orm', 'sqlalchemy.ext', 'sqlalchemy.ext.declarative',
+    'sqlalchemy.ext.hybrid', 'sqlalchemy.sql', 'sqlalchemy.sql.expression',
+    'src.database', 'core.models', 'core.database',
+]:
+    if isinstance(sys.modules.get(mod), MagicMock):
+        sys.modules.pop(mod, None)
+
 
 class TestCompactThreshold:
     def test_value(self):

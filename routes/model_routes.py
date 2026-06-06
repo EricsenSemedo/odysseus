@@ -7,6 +7,7 @@ import json
 import socket
 import time as _time
 import logging
+import threading
 import httpx
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -16,7 +17,13 @@ from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 from core.database import SessionLocal, ModelEndpoint, Session as DbSession
 from core.middleware import require_admin
-from src.llm_core import _detect_provider, _host_match, ANTHROPIC_MODELS
+from src.llm_core import _detect_provider, _host_match, ANTHROPIC_MODELS, is_model_request_active
+from src.model_runtime import (
+    MODEL_RUNTIME_STATE as _MODEL_RUNTIME_STATE,
+    load_runtime_state as _load_runtime_state,
+    runtime_defaults as _runtime_defaults,
+    runtime_settings_for as _runtime_settings_for,
+)
 from src.tls_overrides import llm_verify
 from src.settings import load_settings as _load_settings, save_settings as _save_settings
 from src.endpoint_resolver import (
@@ -28,6 +35,550 @@ from src.endpoint_resolver import (
 from src.auth_helpers import _auth_disabled, owner_filter
 
 logger = logging.getLogger(__name__)
+_MODEL_RUNTIME_BENCHMARK_STATE = _MODEL_RUNTIME_STATE.with_name("model_runtime_benchmarks.json")
+
+
+class ModelRuntimeSettingsRequest(BaseModel):
+    model: str
+    gpu_layers: str | int | None = "auto"
+    keep_alive: str | None = "30m"
+    warm_on_select: bool = True
+
+
+class ModelRuntimeWarmRequest(ModelRuntimeSettingsRequest):
+    pass
+
+
+class ModelRuntimeUnloadRequest(BaseModel):
+    model: str
+
+
+class ModelRuntimeBenchmarkRequest(BaseModel):
+    model: str
+    candidates: List[int] | None = None
+    prompt: str | None = None
+    num_predict: int | None = 96
+    keep_alive: str | None = "30m"
+    mode: str | None = "balanced"
+    apply_best: bool = True
+
+
+_RUNTIME_BENCH_LOCK = threading.Lock()
+_RUNTIME_BENCH_ACTIVE: set[str] = set()
+_RUNTIME_BENCH_JOBS: Dict[str, Dict[str, Any]] = {}
+
+
+def _ollama_api_root(base: str) -> str:
+    """Return Ollama's native API root without depending on deferred imports."""
+    base = (base or "").strip().rstrip("/")
+    parsed = urlparse(base)
+    path = (parsed.path or "").rstrip("/")
+    origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else base
+    if path.endswith("/api"):
+        return base
+    if path.endswith("/api/chat") or path.endswith("/api/generate") or path.endswith("/api/tags"):
+        return base.rsplit("/", 1)[0]
+    if parsed.port == 11434 and (
+        path.endswith("/v1/chat/completions")
+        or path.endswith("/v1/models")
+        or path.endswith("/v1")
+        or not path
+    ):
+        return origin.rstrip("/") + "/api"
+    if _host_match(base, "ollama.com"):
+        root = origin if parsed.scheme and parsed.netloc else "https://ollama.com"
+        return root.rstrip("/") + "/api"
+    return base
+
+
+def _save_runtime_state(state: Dict[str, Any]) -> None:
+    _MODEL_RUNTIME_STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _MODEL_RUNTIME_STATE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(_MODEL_RUNTIME_STATE)
+
+
+def _load_benchmark_state() -> Dict[str, Any]:
+    try:
+        if _MODEL_RUNTIME_BENCHMARK_STATE.exists():
+            data = json.loads(_MODEL_RUNTIME_BENCHMARK_STATE.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.warning("Failed to load model runtime benchmark state", exc_info=True)
+    return {}
+
+
+def _save_benchmark_state(state: Dict[str, Any]) -> None:
+    _MODEL_RUNTIME_BENCHMARK_STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _MODEL_RUNTIME_BENCHMARK_STATE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(_MODEL_RUNTIME_BENCHMARK_STATE)
+
+
+def _benchmark_state_for(ep_id: str, model: str) -> Dict[str, Any] | None:
+    item = (
+        _load_benchmark_state()
+        .get(str(ep_id), {})
+        .get("models", {})
+        .get(str(model))
+    )
+    return item if isinstance(item, dict) else None
+
+
+_BENCHMARK_SENSITIVE_KEYS = {
+    "access_token", "api_key", "auth", "authorization", "bearer",
+    "credentials", "headers", "password", "refresh_token", "root",
+    "secret", "token",
+}
+
+
+def _sanitize_benchmark_state(value: Any) -> Any:
+    if isinstance(value, dict):
+        clean = {}
+        for key, item in value.items():
+            key_s = str(key)
+            key_l = key_s.lower()
+            if key_l in _BENCHMARK_SENSITIVE_KEYS:
+                continue
+            clean[key_s] = _sanitize_benchmark_state(item)
+        return clean
+    if isinstance(value, list):
+        return [_sanitize_benchmark_state(item) for item in value]
+    return value
+
+
+def _store_benchmark_state(ep_id: str, model: str, result: Dict[str, Any]) -> None:
+    state = _load_benchmark_state()
+    ep_state = state.setdefault(str(ep_id), {})
+    models = ep_state.setdefault("models", {})
+    clean = _sanitize_benchmark_state(result)
+    if isinstance(clean, dict):
+        clean.pop("cancel_event", None)
+    else:
+        clean = {}
+    clean["saved_at"] = datetime.utcnow().isoformat() + "Z"
+    models[str(model)] = clean
+    _save_benchmark_state(state)
+
+
+def _store_runtime_settings(ep_id: str, model: str, settings: Dict[str, Any]) -> Dict[str, Any]:
+    clean = _normalize_runtime_settings(settings)
+    state = _load_runtime_state()
+    ep_state = state.setdefault(str(ep_id), {})
+    models = ep_state.setdefault("models", {})
+    models[str(model)] = clean
+    _save_runtime_state(state)
+    return clean
+
+
+def _normalize_runtime_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
+    clean = _runtime_defaults()
+    clean.update({
+        "gpu_layers": settings.get("gpu_layers", clean["gpu_layers"]),
+        "keep_alive": (settings.get("keep_alive") or clean["keep_alive"]),
+        "warm_on_select": bool(settings.get("warm_on_select", clean["warm_on_select"])),
+    })
+    if clean["gpu_layers"] not in ("auto", "", None):
+        try:
+            clean["gpu_layers"] = max(0, int(clean["gpu_layers"]))
+        except Exception:
+            clean["gpu_layers"] = "auto"
+    else:
+        clean["gpu_layers"] = "auto"
+    return clean
+
+
+def _ollama_request_timeout(read: float = 300.0) -> httpx.Timeout:
+    return httpx.Timeout(connect=5.0, read=read, write=10.0, pool=5.0)
+
+
+def _ollama_upstream_error(prefix: str, root: str, exc: Exception) -> HTTPException:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code:
+        body = ""
+        try:
+            body = (getattr(response, "text", "") or "")[:500]
+        except Exception:
+            body = ""
+        detail = f"{prefix}: Ollama {root.rstrip('/')} returned HTTP {status_code}"
+        if body:
+            detail += f": {body}"
+        return HTTPException(502, detail)
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
+        return HTTPException(503, f"{prefix}: cannot reach Ollama at {root.rstrip('/')}: {exc}")
+    if isinstance(exc, httpx.ReadTimeout):
+        return HTTPException(504, f"{prefix}: Ollama at {root.rstrip('/')} did not respond before the read timeout")
+    return HTTPException(502, f"{prefix}: {exc}")
+
+
+def _ollama_show_result(root: str, model: str, headers: Dict[str, str] | None = None) -> Dict[str, Any]:
+    try:
+        r = httpx.post(
+            root.rstrip("/") + "/show",
+            json={"model": model, "verbose": True},
+            headers=headers or {},
+            timeout=15,
+            verify=llm_verify(),
+        )
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict):
+            return {"ok": True, "data": data, "error": None}
+        return {"ok": False, "data": {}, "error": "Ollama /api/show returned a non-object response"}
+    except Exception as e:
+        response = getattr(e, "response", None)
+        status_code = getattr(response, "status_code", None)
+        body = ""
+        try:
+            body = (getattr(response, "text", "") or "")[:180]
+        except Exception:
+            body = ""
+        if status_code:
+            detail = f"Ollama /api/show returned HTTP {status_code}"
+            if body:
+                detail += f": {body}"
+        else:
+            detail = f"Ollama /api/show failed: {e}"
+        return {"ok": False, "data": {}, "error": detail}
+
+
+def _ollama_block_count(show_data: Dict[str, Any]) -> int | None:
+    info = show_data.get("model_info") or show_data.get("details") or {}
+    if isinstance(info, dict):
+        for key, val in info.items():
+            if str(key).endswith(".block_count"):
+                try:
+                    return int(val)
+                except Exception:
+                    return None
+    return None
+
+
+def _ollama_gpu_layer_max(show_data: Dict[str, Any]) -> int | None:
+    block_count = _ollama_block_count(show_data)
+    if block_count is None:
+        return None
+    return block_count + 1
+
+
+def _ollama_layer_metadata(show_data: Dict[str, Any], show_error: str | None = None) -> Dict[str, Any]:
+    block_count = _ollama_block_count(show_data)
+    gpu_layer_max = _ollama_gpu_layer_max(show_data)
+    estimated = gpu_layer_max is None
+    fallback_max = 49
+    if estimated:
+        gpu_layer_max = fallback_max
+    if show_error:
+        metadata_error = show_error
+    elif estimated:
+        metadata_error = "Ollama /api/show did not include GGUF block_count metadata; using an estimated layer range."
+    else:
+        metadata_error = None
+    return {
+        "architecture": ((show_data.get("details") or {}).get("family") or (show_data.get("model_info") or {}).get("general.architecture")),
+        "parameter_size": (show_data.get("details") or {}).get("parameter_size"),
+        "quantization_level": (show_data.get("details") or {}).get("quantization_level"),
+        "block_count": block_count,
+        "gpu_layer_max": gpu_layer_max,
+        "gpu_layer_max_estimated": estimated,
+        "metadata_available": bool(show_data),
+        "metadata_error": metadata_error,
+    }
+
+
+def _runtime_benchmark_candidates(block_count: int | None, requested: List[int] | None) -> List[int]:
+    vals = requested if requested else [int(block_count or 48) + 1, max((int(block_count or 48) + 1) // 2, 0), 0]
+    out: List[int] = []
+    for val in vals:
+        try:
+            clean = max(0, int(val))
+        except Exception:
+            continue
+        if clean not in out:
+            out.append(clean)
+    return out
+
+
+def _runtime_benchmark_next_candidate(
+    rows: List[Dict[str, Any]],
+    max_layers: int,
+    tested_candidates: List[int] | None = None,
+) -> int | None:
+    max_layers = max(0, int(max_layers or 0))
+    tested = set()
+    for val in tested_candidates or []:
+        try:
+            tested.add(max(0, int(val)))
+        except Exception:
+            continue
+    for row in rows:
+        try:
+            tested.add(max(0, int(row.get("gpu_layers"))))
+        except Exception:
+            continue
+
+    def _unused_midpoint(low: int, high: int) -> tuple[int, int] | None:
+        low = max(0, min(max_layers, int(low)))
+        high = max(0, min(max_layers, int(high)))
+        if high - low <= 1:
+            return None
+        cand = (low + high) // 2
+        if cand <= low:
+            cand = low + 1
+        if cand >= high:
+            cand = high - 1
+        if cand in tested:
+            return None
+        return high - low, cand
+
+    ok_layers = sorted({
+        int(r.get("gpu_layers"))
+        for r in rows
+        if r.get("ok") and r.get("gpu_layers") is not None
+    })
+    failed_layers = sorted({
+        int(r.get("gpu_layers"))
+        for r in rows
+        if not r.get("ok") and r.get("gpu_layers") is not None
+    })
+
+    fit_gaps: List[tuple[int, int]] = []
+    for failed in failed_layers:
+        lower_ok = [layer for layer in ok_layers if layer < failed]
+        if not lower_ok:
+            continue
+        gap = _unused_midpoint(max(lower_ok), failed)
+        if gap:
+            fit_gaps.append(gap)
+    if fit_gaps:
+        return max(fit_gaps)[1]
+
+    ok_rows = [r for r in rows if r.get("ok")]
+    if not ok_rows:
+        return None
+    best = max(ok_rows, key=lambda r: r.get("score", -1_000_000.0))
+    try:
+        best_layers = max(0, min(max_layers, int(best.get("gpu_layers"))))
+    except Exception:
+        return None
+
+    tested_sorted = sorted(tested)
+    lower = [layer for layer in tested_sorted if layer < best_layers]
+    higher = [layer for layer in tested_sorted if layer > best_layers]
+    speed_gaps: List[tuple[int, int]] = []
+    if lower:
+        gap = _unused_midpoint(max(lower), best_layers)
+        if gap:
+            speed_gaps.append(gap)
+    if higher:
+        gap = _unused_midpoint(best_layers, min(higher))
+        if gap:
+            speed_gaps.append(gap)
+    if speed_gaps:
+        return max(speed_gaps)[1]
+    return None
+
+
+def _runtime_benchmark_score(row: Dict[str, Any], mode: str) -> float:
+    if not row.get("ok"):
+        return -1_000_000.0
+    gen_tps = float(row.get("tokens_per_second") or 0)
+    prompt_tps = float(row.get("prompt_tokens_per_second") or 0)
+    load_s = float(row.get("load_seconds") or 0)
+    vram_gb = float(row.get("vram_gb") or 0)
+    mode = (mode or "balanced").strip().lower()
+    score = gen_tps + (prompt_tps * 0.05)
+    if mode == "max_speed":
+        score -= load_s * 0.02
+    elif mode == "leave_vram":
+        score -= vram_gb * 0.35
+        score -= load_s * 0.04
+    elif mode == "background_safe":
+        score -= vram_gb * 0.55
+        score -= load_s * 0.05
+    else:
+        score -= vram_gb * 0.12
+        score -= load_s * 0.03
+    return round(score, 4)
+
+
+def _ollama_loaded_item(root: str, model: str, headers: Dict[str, str]) -> Dict[str, Any]:
+    try:
+        r = httpx.get(root.rstrip("/") + "/ps", headers=headers, timeout=5, verify=llm_verify())
+        r.raise_for_status()
+        for item in (r.json().get("models") or []):
+            if item.get("name") == model or item.get("model") == model:
+                return item if isinstance(item, dict) else {}
+    except Exception:
+        return {}
+    return {}
+
+
+def _set_benchmark_job(job_id: str, **fields) -> Dict[str, Any]:
+    with _RUNTIME_BENCH_LOCK:
+        job = _RUNTIME_BENCH_JOBS.get(job_id)
+        if not job:
+            return {}
+        job.update(fields)
+        job["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        return dict(job)
+
+
+def _benchmark_job_public(job_id: str) -> Dict[str, Any]:
+    with _RUNTIME_BENCH_LOCK:
+        job = _RUNTIME_BENCH_JOBS.get(job_id)
+        if not job:
+            return {}
+        return {
+            k: v for k, v in job.items()
+            if k not in {"cancel_event", "headers", "root", "bench_key", "prompt"}
+        }
+
+
+def _run_runtime_benchmark_job(job_id: str) -> None:
+    with _RUNTIME_BENCH_LOCK:
+        job = _RUNTIME_BENCH_JOBS.get(job_id)
+    if not job:
+        return
+    ep_id = job["endpoint_id"]
+    model = job["model"]
+    bench_key = job["bench_key"]
+    root = job["root"]
+    headers = job["headers"]
+    candidates = list(job["candidates"])
+    initial_candidate_count = len(candidates)
+    adaptive = bool(job.get("adaptive"))
+    max_candidate_count = int(job.get("max_candidate_count") or len(candidates))
+    max_layers = int(job.get("max_layers") or 0)
+    prompt = job["prompt"]
+    expected = job.get("expected")
+    num_predict = int(job["num_predict"])
+    keep_alive = job["keep_alive"]
+    mode = job["mode"]
+    apply_best = bool(job["apply_best"])
+    cancel_event = job["cancel_event"]
+    rows: List[Dict[str, Any]] = []
+    try:
+        _set_benchmark_job(job_id, status="running", message="Starting benchmark", current_index=0, results=[])
+        idx = 0
+        while idx < len(candidates):
+            layers = candidates[idx]
+            idx += 1
+            if cancel_event.is_set():
+                _set_benchmark_job(job_id, status="cancelled", message="Cancelled before next candidate", results=rows)
+                return
+            _set_benchmark_job(
+                job_id,
+                status="running",
+                current_index=idx,
+                current_layers=layers,
+                message=f"Testing {layers} GPU layers ({idx}/{len(candidates)})",
+                results=rows,
+            )
+            try:
+                httpx.post(root.rstrip("/") + "/generate", json={"model": model, "prompt": "", "stream": False, "keep_alive": 0}, headers=headers, timeout=60, verify=llm_verify())
+            except Exception:
+                pass
+            payload: Dict[str, Any] = {
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "keep_alive": keep_alive,
+                "options": {"num_gpu": layers, "num_predict": num_predict, "temperature": 0},
+            }
+            row: Dict[str, Any] = {"gpu_layers": layers, "ok": False}
+            try:
+                started = _time.time()
+                r = httpx.post(root.rstrip("/") + "/generate", json=payload, headers=headers, timeout=300, verify=llm_verify())
+                elapsed = _time.time() - started
+                r.raise_for_status()
+                data = r.json()
+                response_text = str(data.get("response") or "")
+                if expected and expected.lower() not in response_text.lower():
+                    row["response_preview"] = response_text[:120]
+                    raise ValueError(f"Unexpected output: {response_text[:80]!r}")
+                eval_count = int(data.get("eval_count") or 0)
+                eval_duration = int(data.get("eval_duration") or 0)
+                prompt_count = int(data.get("prompt_eval_count") or 0)
+                prompt_duration = int(data.get("prompt_eval_duration") or 0)
+                total_duration = int(data.get("total_duration") or 0)
+                load_duration = int(data.get("load_duration") or 0)
+                loaded = _ollama_loaded_item(root, model, headers)
+                size = int(loaded.get("size") or 0)
+                size_vram = int(loaded.get("size_vram") or 0)
+                row.update({
+                    "ok": True,
+                    "elapsed_seconds": round(elapsed, 3),
+                    "total_seconds": round(total_duration / 1_000_000_000, 3) if total_duration else round(elapsed, 3),
+                    "load_seconds": round(load_duration / 1_000_000_000, 3) if load_duration else 0,
+                    "eval_count": eval_count,
+                    "eval_seconds": round(eval_duration / 1_000_000_000, 3) if eval_duration else 0,
+                    "tokens_per_second": round(eval_count / (eval_duration / 1_000_000_000), 2) if eval_count and eval_duration else 0,
+                    "prompt_eval_count": prompt_count,
+                    "prompt_eval_seconds": round(prompt_duration / 1_000_000_000, 3) if prompt_duration else 0,
+                    "prompt_tokens_per_second": round(prompt_count / (prompt_duration / 1_000_000_000), 2) if prompt_count and prompt_duration else 0,
+                    "size": size,
+                    "size_vram": size_vram,
+                    "vram_gb": round(size_vram / (1024 ** 3), 3) if size_vram else 0,
+                    "processor": loaded.get("processor") or "",
+                })
+            except Exception as e:
+                row["error"] = str(e)
+            row["score"] = _runtime_benchmark_score(row, mode)
+            rows.append(row)
+            if adaptive and idx >= initial_candidate_count and len(candidates) < max_candidate_count:
+                next_candidate = _runtime_benchmark_next_candidate(rows, max_layers, candidates)
+                if next_candidate is not None and next_candidate not in candidates:
+                    candidates.append(next_candidate)
+            _set_benchmark_job(job_id, results=rows, candidates=candidates)
+
+        ok_rows = [r for r in rows if r.get("ok")]
+        if not ok_rows:
+            _set_benchmark_job(job_id, status="failed", message="All benchmark candidates failed", results=rows)
+            return
+        best = max(ok_rows, key=lambda r: r.get("score", -1_000_000.0))
+        applied = False
+        if apply_best and not cancel_event.is_set():
+            _set_benchmark_job(job_id, message=f"Applying best setting: {best['gpu_layers']} GPU layers")
+            current_settings = _runtime_settings_for(ep_id, model)
+            _store_runtime_settings(ep_id, model, {
+                "gpu_layers": int(best["gpu_layers"]),
+                "keep_alive": keep_alive,
+                "warm_on_select": bool(current_settings.get("warm_on_select", False)),
+            })
+            try:
+                httpx.post(root.rstrip("/") + "/generate", json={"model": model, "prompt": "", "stream": False, "keep_alive": 0}, headers=headers, timeout=60, verify=llm_verify())
+            except Exception:
+                pass
+            try:
+                httpx.post(
+                    root.rstrip("/") + "/generate",
+                    json={"model": model, "prompt": "", "stream": False, "keep_alive": keep_alive, "options": {"num_gpu": int(best["gpu_layers"])}},
+                    headers=headers,
+                    timeout=300,
+                    verify=llm_verify(),
+                ).raise_for_status()
+                applied = True
+            except Exception as e:
+                best["apply_error"] = str(e)
+        status = "cancelled" if cancel_event.is_set() else "completed"
+        final = _set_benchmark_job(
+            job_id,
+            status=status,
+            message="Cancelled after current candidate" if cancel_event.is_set() else "Benchmark complete",
+            results=rows,
+            best=best,
+            applied=applied,
+            completed_at=datetime.utcnow().isoformat() + "Z",
+        )
+        if status == "completed":
+            _store_benchmark_state(ep_id, model, final)
+    except Exception as e:
+        _set_benchmark_job(job_id, status="failed", message=str(e), error=str(e), results=rows)
+    finally:
+        with _RUNTIME_BENCH_LOCK:
+            _RUNTIME_BENCH_ACTIVE.discard(bench_key)
 
 _SPEECH_ENDPOINT_SETTINGS = (
     ("tts_provider", "tts_model", "tts-1", "Text to Speech"),
@@ -1774,6 +2325,276 @@ def setup_model_routes(model_discovery):
             return {"id": ep_id, "hidden_count": hidden_count, "pinned_count": pinned_count}
         finally:
             db.close()
+
+    @router.get("/model-endpoints/{ep_id}/runtime")
+    def get_model_runtime(ep_id: str, request: Request, model: str = Query(...)):
+        """Return runtime controls/status for one endpoint model."""
+        require_admin(request)
+        db = SessionLocal()
+        try:
+            ep = db.query(ModelEndpoint).filter(ModelEndpoint.id == ep_id).first()
+            if not ep:
+                raise HTTPException(404, "Endpoint not found")
+            base = _normalize_base(ep.base_url)
+            api_key = ep.api_key
+        finally:
+            db.close()
+
+        settings = _runtime_settings_for(ep_id, model)
+        is_ollama = _is_ollama_base(base)
+        result: Dict[str, Any] = {
+            "endpoint_id": ep_id,
+            "model": model,
+            "backend": "ollama" if is_ollama else "openai-compatible",
+            "supported": bool(is_ollama),
+            "settings": settings,
+            "loaded": False,
+            "status": None,
+            "metadata": {},
+            "benchmark": _benchmark_state_for(ep_id, model),
+        }
+        if not is_ollama:
+            result["message"] = "Runtime residency controls are available for Ollama endpoints only."
+            return result
+
+        root = _ollama_api_root(base)
+        headers = build_headers(api_key, base)
+        show_result = _ollama_show_result(root, model, headers)
+        show_data = show_result.get("data") or {}
+        result["metadata"] = _ollama_layer_metadata(show_data, show_result.get("error"))
+        try:
+            r = httpx.get(root.rstrip("/") + "/ps", headers=headers, timeout=4, verify=llm_verify())
+            r.raise_for_status()
+            models = r.json().get("models") or []
+            for item in models:
+                if item.get("name") == model or item.get("model") == model:
+                    size = item.get("size") or 0
+                    size_vram = item.get("size_vram") or 0
+                    processor = item.get("processor")
+                    if not processor:
+                        try:
+                            if int(size_vram) <= 0:
+                                processor = "100% CPU"
+                            elif int(size) > 0 and int(size_vram) >= int(size) * 0.95:
+                                processor = "100% GPU"
+                            else:
+                                pct = round((int(size_vram) / max(int(size), 1)) * 100)
+                                processor = f"{pct}% GPU"
+                        except Exception:
+                            processor = ""
+                    result["loaded"] = True
+                    result["status"] = {
+                        "name": item.get("name") or item.get("model"),
+                        "size": size,
+                        "size_vram": size_vram,
+                        "processor": processor,
+                        "context": item.get("context") or item.get("context_length"),
+                        "until": item.get("expires_at") or item.get("until"),
+                    }
+                    break
+        except Exception as e:
+            result["status_error"] = str(e)
+        return result
+
+    @router.post("/model-endpoints/{ep_id}/runtime/settings")
+    def save_model_runtime_settings(ep_id: str, req: ModelRuntimeSettingsRequest, request: Request):
+        require_admin(request)
+        model = (req.model or "").strip()
+        if not model:
+            raise HTTPException(400, "model is required")
+        db = SessionLocal()
+        try:
+            if not db.query(ModelEndpoint).filter(ModelEndpoint.id == ep_id).first():
+                raise HTTPException(404, "Endpoint not found")
+        finally:
+            db.close()
+        settings = _store_runtime_settings(ep_id, model, req.model_dump())
+        return {"ok": True, "endpoint_id": ep_id, "model": model, "settings": settings}
+
+    @router.post("/model-endpoints/{ep_id}/runtime/warm")
+    def warm_model_runtime(ep_id: str, req: ModelRuntimeWarmRequest, request: Request):
+        require_admin(request)
+        model = (req.model or "").strip()
+        if not model:
+            raise HTTPException(400, "model is required")
+        db = SessionLocal()
+        try:
+            ep = db.query(ModelEndpoint).filter(ModelEndpoint.id == ep_id).first()
+            if not ep:
+                raise HTTPException(404, "Endpoint not found")
+            base = _normalize_base(ep.base_url)
+            api_key = ep.api_key
+        finally:
+            db.close()
+        if not _is_ollama_base(base):
+            raise HTTPException(400, "Warm/unload is currently supported for Ollama endpoints only")
+
+        existing_settings = _runtime_settings_for(ep_id, model)
+        incoming = req.model_dump()
+        explicit = set(getattr(req, "model_fields_set", set())) - {"model"}
+        merged_settings = dict(existing_settings)
+        for field in ("gpu_layers", "keep_alive", "warm_on_select"):
+            if field in explicit:
+                merged_settings[field] = incoming.get(field)
+        settings = _normalize_runtime_settings(merged_settings)
+        root = _ollama_api_root(base)
+        headers = build_headers(api_key, base)
+        if is_model_request_active(root, model):
+            raise HTTPException(409, "Model is currently generating. Wait for the run to finish before warming or reloading it.")
+        payload: Dict[str, Any] = {
+            "model": model,
+            "prompt": "",
+            "stream": False,
+            "keep_alive": settings["keep_alive"],
+        }
+        if settings["gpu_layers"] != "auto":
+            payload["options"] = {"num_gpu": int(settings["gpu_layers"])}
+        try:
+            r = httpx.post(root.rstrip("/") + "/generate", json=payload, headers=headers, timeout=_ollama_request_timeout(300), verify=llm_verify())
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            raise _ollama_upstream_error("Ollama warm failed", root, e)
+        _store_runtime_settings(ep_id, model, settings)
+        status = get_model_runtime(ep_id, request, model)
+        return {"ok": True, "response": data, "runtime": status}
+
+    @router.post("/model-endpoints/{ep_id}/runtime/unload")
+    def unload_model_runtime(ep_id: str, req: ModelRuntimeUnloadRequest, request: Request):
+        require_admin(request)
+        model = (req.model or "").strip()
+        if not model:
+            raise HTTPException(400, "model is required")
+        db = SessionLocal()
+        try:
+            ep = db.query(ModelEndpoint).filter(ModelEndpoint.id == ep_id).first()
+            if not ep:
+                raise HTTPException(404, "Endpoint not found")
+            base = _normalize_base(ep.base_url)
+            api_key = ep.api_key
+        finally:
+            db.close()
+        if not _is_ollama_base(base):
+            raise HTTPException(400, "Unload is currently supported for Ollama endpoints only")
+        root = _ollama_api_root(base)
+        headers = build_headers(api_key, base)
+        if is_model_request_active(root, model):
+            raise HTTPException(409, "Model is currently generating. Wait for the run to finish before unloading it.")
+        payload = {"model": model, "prompt": "", "stream": False, "keep_alive": 0}
+        try:
+            r = httpx.post(root.rstrip("/") + "/generate", json=payload, headers=headers, timeout=_ollama_request_timeout(60), verify=llm_verify())
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            raise _ollama_upstream_error("Ollama unload failed", root, e)
+        status = get_model_runtime(ep_id, request, model)
+        return {"ok": True, "response": data, "runtime": status}
+
+    @router.post("/model-endpoints/{ep_id}/runtime/benchmark")
+    def benchmark_model_runtime(ep_id: str, req: ModelRuntimeBenchmarkRequest, request: Request):
+        require_admin(request)
+        model = (req.model or "").strip()
+        if not model:
+            raise HTTPException(400, "model is required")
+        mode = (req.mode or "balanced").strip().lower()
+        if mode not in {"max_speed", "balanced", "leave_vram", "background_safe"}:
+            mode = "balanced"
+        db = SessionLocal()
+        try:
+            ep = db.query(ModelEndpoint).filter(ModelEndpoint.id == ep_id).first()
+            if not ep:
+                raise HTTPException(404, "Endpoint not found")
+            base = _normalize_base(ep.base_url)
+            api_key = ep.api_key
+        finally:
+            db.close()
+        if not _is_ollama_base(base):
+            raise HTTPException(400, "Benchmark is currently supported for Ollama endpoints only")
+
+        root = _ollama_api_root(base)
+        headers = build_headers(api_key, base)
+        if is_model_request_active(root, model):
+            raise HTTPException(409, "Model is currently generating. Wait for the run to finish before benchmarking.")
+
+        bench_key = f"{ep_id}|{model}"
+        show_result = _ollama_show_result(root, model, headers)
+        show_data = show_result.get("data") or {}
+        block_count = _ollama_block_count(show_data)
+        candidates = _runtime_benchmark_candidates(block_count, req.candidates)
+        max_layers = int(block_count or 48) + 1
+        adaptive = not bool(req.candidates)
+        custom_prompt = (req.prompt or "").strip()
+        expected = None
+        if custom_prompt:
+            prompt = custom_prompt
+        else:
+            expected = "ODYSSEUS_LAYER_TEST_OK"
+            prompt = f"Reply with exactly this text and nothing else: {expected}"
+        num_predict = max(16, min(int(req.num_predict or 96), 512))
+        keep_alive = (req.keep_alive or "30m").strip() or "30m"
+        job_id = uuid.uuid4().hex
+        now = datetime.utcnow().isoformat() + "Z"
+        cancel_event = threading.Event()
+        with _RUNTIME_BENCH_LOCK:
+            if bench_key in _RUNTIME_BENCH_ACTIVE:
+                raise HTTPException(409, "Benchmark already running for this model")
+            _RUNTIME_BENCH_ACTIVE.add(bench_key)
+            _RUNTIME_BENCH_JOBS[job_id] = {
+                "ok": True,
+                "job_id": job_id,
+                "endpoint_id": ep_id,
+                "model": model,
+                "mode": mode,
+                "status": "queued",
+                "message": "Queued",
+                "bench_key": bench_key,
+                "root": root,
+                "headers": headers,
+                "candidates": candidates,
+                "adaptive": adaptive,
+                "max_layers": max_layers,
+                "max_candidate_count": 9 if adaptive else len(candidates),
+                "current_index": 0,
+                "current_layers": None,
+                "results": [],
+                "best": None,
+                "applied": False,
+                "prompt": prompt,
+                "expected": expected,
+                "num_predict": num_predict,
+                "keep_alive": keep_alive,
+                "apply_best": bool(req.apply_best),
+                "cancel_event": cancel_event,
+                "created_at": now,
+                "updated_at": now,
+            }
+        thread = threading.Thread(target=_run_runtime_benchmark_job, args=(job_id,), daemon=True)
+        thread.start()
+        return _benchmark_job_public(job_id)
+
+    @router.get("/model-endpoints/{ep_id}/runtime/benchmark/{job_id}")
+    def get_model_runtime_benchmark(ep_id: str, job_id: str, request: Request):
+        require_admin(request)
+        job = _benchmark_job_public(job_id)
+        if not job or job.get("endpoint_id") != ep_id:
+            raise HTTPException(404, "Benchmark job not found")
+        return job
+
+    @router.post("/model-endpoints/{ep_id}/runtime/benchmark/{job_id}/cancel")
+    def cancel_model_runtime_benchmark(ep_id: str, job_id: str, request: Request):
+        require_admin(request)
+        with _RUNTIME_BENCH_LOCK:
+            job = _RUNTIME_BENCH_JOBS.get(job_id)
+            if not job or job.get("endpoint_id") != ep_id:
+                raise HTTPException(404, "Benchmark job not found")
+            if job.get("status") in {"completed", "failed", "cancelled"}:
+                already_done = True
+            else:
+                already_done = False
+                job["cancel_event"].set()
+                job["message"] = "Cancelling after current candidate finishes"
+                job["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        return _benchmark_job_public(job_id)
 
     @router.get("/default-chat")
     def get_default_chat(request: Request):

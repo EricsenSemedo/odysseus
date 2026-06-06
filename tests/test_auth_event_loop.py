@@ -75,6 +75,10 @@ def _event_loop_stubs(monkeypatch):
 
 from routes.auth_routes import setup_auth_routes, LoginRequest
 
+for _mod in ("core.database", "core.auth"):
+    if isinstance(sys.modules.get(_mod), MagicMock) or not getattr(sys.modules.get(_mod), "__file__", None):
+        sys.modules.pop(_mod, None)
+
 
 def _login_endpoint(auth_manager):
     router = setup_auth_routes(auth_manager)

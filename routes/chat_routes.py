@@ -18,6 +18,7 @@ from src.llm_core import llm_call_async, stream_llm, stream_llm_with_fallback
 from src.agent_loop import stream_agent_loop
 from src import agent_runs
 from src.model_context import estimate_tokens
+from src.model_runtime import is_ollama_runtime_url
 from src.chat_helpers import coerce_message_and_session
 from src.endpoint_resolver import normalize_base as _normalize_base, build_chat_url
 from src.prompt_security import untrusted_context_message
@@ -876,6 +877,8 @@ def setup_chat_routes(
                 # ── Chat mode: call stream_llm directly, NO tools, NO document access ──
                 try:
                     _chat_candidates = [(sess.endpoint_url, sess.model, sess.headers)] + _fallback_candidates
+                    if is_ollama_runtime_url(sess.endpoint_url):
+                        yield f'data: {json.dumps({"type": "model_status", "phase": "loading", "message": "Loading model or waiting for GPU"})}\n\n'
                     async for chunk in stream_llm_with_fallback(
                         _chat_candidates,
                         messages,
@@ -1055,6 +1058,8 @@ def setup_chat_routes(
                             except json.JSONDecodeError:
                                 yield chunk
                         elif chunk.startswith("event: "):
+                            yield chunk
+                        elif chunk.startswith(":"):
                             yield chunk
                         elif chunk == "data: [DONE]\n\n":
                             if full_response:

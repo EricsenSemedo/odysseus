@@ -107,7 +107,6 @@ class TestProbeEndpointParsing:
 
         monkeypatch.setattr(model_routes.httpx, "get", fake_get)
         assert _probe_endpoint("http://localhost:11434/v1") == ["llama3:8b"]
-        assert "http://localhost:11434/v1/models" in seen
         assert "http://localhost:11434/api/tags" in seen
 
     def test_empty_list_with_no_curation_returns_empty(self, monkeypatch):

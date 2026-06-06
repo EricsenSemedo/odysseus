@@ -72,6 +72,29 @@ function _setSortMode(mode) {
   Storage.set(SORT_KEY, mode);
 }
 
+async function _warmOnSelect(endpointId, modelId) {
+  if (!endpointId || !modelId) return;
+  try {
+    const statusRes = await fetch(`${API_BASE}/api/model-endpoints/${endpointId}/runtime?model=${encodeURIComponent(modelId)}`, { credentials: 'same-origin' });
+    if (!statusRes.ok) return;
+    const status = await statusRes.json();
+    if (!status.supported || status.settings?.warm_on_select === false) return;
+    await fetch(`${API_BASE}/api/model-endpoints/${endpointId}/runtime/warm`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: modelId,
+        gpu_layers: status.settings?.gpu_layers ?? 'auto',
+        keep_alive: status.settings?.keep_alive || '30m',
+        warm_on_select: true,
+      }),
+    });
+  } catch (_) {
+    // Best-effort only; chat creation should not depend on preload success.
+  }
+}
+
 /**
  * Build a single model row element.
  */
@@ -79,6 +102,7 @@ function _startChat(url, mid, endpointId) {
   // Block model switching while compare mode is active
   if (window.compareModule && window.compareModule.isActive()) return;
   _trackUsage(mid);
+  _warmOnSelect(endpointId, mid);
   if (sessionModule) {
     sessionModule.createDirectChat(url, mid, endpointId);
   } else if (uiModule) {

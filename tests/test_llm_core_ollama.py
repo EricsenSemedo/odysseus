@@ -2,6 +2,7 @@
 import httpx
 
 from src import llm_core
+from src import model_runtime
 
 
 def test_detects_ollama_cloud_native_provider():
@@ -240,3 +241,71 @@ def test_stream_llm_threads_discovered_num_ctx(monkeypatch):
     assert seen["num_ctx"] == 32768
     assert seen["stream"] is True
     assert out  # we got the SSE error chunk
+
+
+def test_runtime_payload_options_merge_saved_ollama_settings(monkeypatch):
+    monkeypatch.setattr(
+        model_runtime,
+        "runtime_settings_for_url",
+        lambda url, model: {
+            "gpu_layers": 21,
+            "keep_alive": "1h",
+            "warm_on_select": True,
+        },
+    )
+    payload = {"model": "qwen3-coder:30b", "messages": [], "options": {"temperature": 0.4}}
+
+    changed = model_runtime.apply_ollama_runtime_payload_options(
+        payload,
+        "http://100.94.209.47:11434/v1/chat/completions",
+        "qwen3-coder:30b",
+    )
+
+    assert changed is True
+    assert payload["keep_alive"] == "1h"
+    assert payload["options"] == {"temperature": 0.4, "num_gpu": 21}
+
+
+def test_remote_ollama_v1_payload_uses_native_chat_with_runtime_options(monkeypatch):
+    seen = {}
+
+    def fake_runtime(payload, url, model):
+        payload["keep_alive"] = "30m"
+        payload.setdefault("options", {})["num_gpu"] = 48
+        return True
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        seen["url"] = url
+        seen["json"] = json
+        request = httpx.Request("POST", url)
+        return httpx.Response(
+            200,
+            request=request,
+            json={"message": {"content": "OK"}, "done": True},
+        )
+
+    monkeypatch.setattr(llm_core, "apply_ollama_runtime_payload_options", fake_runtime)
+    monkeypatch.setattr(llm_core.httpx, "post", fake_post)
+
+    result = llm_core.llm_call(
+        "http://100.94.209.47:11434/v1/chat/completions",
+        "qwen3-coder:30b",
+        [{"role": "user", "content": "Say OK"}],
+    )
+
+    assert result == "OK"
+    assert seen["url"] == "http://100.94.209.47:11434/api/chat"
+    assert seen["json"]["keep_alive"] == "30m"
+    assert seen["json"]["options"]["temperature"] == 1.0
+    assert seen["json"]["options"]["num_gpu"] == 48
+    assert seen["json"]["options"]["num_ctx"] == 131072
+
+
+def test_active_model_request_matches_same_origin_across_ollama_paths():
+    model = "qwen3-coder:30b-test-active"
+    llm_core.note_model_request_start("http://100.94.209.47:11434/v1/chat/completions", model)
+    try:
+        assert llm_core.is_model_request_active("http://100.94.209.47:11434/api", model) is True
+    finally:
+        llm_core.note_model_request_end("http://100.94.209.47:11434/v1/chat/completions", model)
+    assert llm_core.is_model_request_active("http://100.94.209.47:11434/api", model) is False

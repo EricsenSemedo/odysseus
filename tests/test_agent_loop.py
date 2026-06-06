@@ -61,6 +61,14 @@ def test_import_stubs_do_not_leak_into_later_tests():
 def test_mcp_keyword_gate_matches_literal_mcp_requests():
     assert "mcp" in _MCP_KEYWORDS
 
+for mod in [
+    'sqlalchemy', 'sqlalchemy.orm', 'sqlalchemy.ext', 'sqlalchemy.ext.declarative',
+    'sqlalchemy.ext.hybrid', 'sqlalchemy.sql', 'sqlalchemy.sql.expression',
+    'src.database', 'src.agent_tools', 'core.models', 'core.database',
+]:
+    if isinstance(sys.modules.get(mod), MagicMock):
+        sys.modules.pop(mod, None)
+
 
 # ---------------------------------------------------------------------------
 # _detect_admin_intent

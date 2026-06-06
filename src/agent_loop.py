@@ -1693,6 +1693,40 @@ async def stream_agent_loop(
     # so the user can resume instead of the turn silently stalling.
     _exhausted_rounds = False
 
+    async def _with_heartbeat(agen, label: str, interval: float = 5.0):
+        """Yield from an async SSE iterator, emitting comment heartbeats while
+        the upstream model is silent. The frontend ignores comment lines for
+        rendering but still sees bytes, so its stream watchdog can tell this is
+        a live wait rather than a dead reader."""
+        queue: asyncio.Queue = asyncio.Queue()
+        sentinel = object()
+
+        async def _pump():
+            try:
+                async for item in agen:
+                    await queue.put(("chunk", item))
+            except BaseException as exc:
+                await queue.put(("error", exc))
+            finally:
+                await queue.put(("done", sentinel))
+
+        task = asyncio.create_task(_pump())
+        try:
+            while True:
+                try:
+                    kind, item = await asyncio.wait_for(queue.get(), timeout=interval)
+                except asyncio.TimeoutError:
+                    yield f": heartbeat {label}\n\n"
+                    continue
+                if kind == "done":
+                    break
+                if kind == "error":
+                    raise item
+                yield item
+        finally:
+            if not task.done():
+                task.cancel()
+
     for round_num in range(1, max_rounds + 1):
         round_response = ""
         round_reasoning = ""  # reasoning_content deltas (DeepSeek-thinking, vLLM --reasoning-parser)
@@ -1758,18 +1792,24 @@ async def stream_agent_loop(
         # complementary cap for the rare stream that trickles bytes forever and
         # so never trips the inactivity timeout. Generous — only catches runaway.
         _round_deadline = time.time() + max(agent_stream_timeout * 4, 1200)
-        async for chunk in stream_llm_with_fallback(
-            _candidates,
-            messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            prompt_type=prompt_type if round_num == 1 else None,
-            tools=all_tool_schemas if all_tool_schemas else None,
-            timeout=agent_stream_timeout,
+        async for chunk in _with_heartbeat(
+            stream_llm_with_fallback(
+                _candidates,
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                prompt_type=prompt_type if round_num == 1 else None,
+                tools=all_tool_schemas if all_tool_schemas else None,
+                timeout=agent_stream_timeout,
+            ),
+            f"agent round {round_num} waiting for model",
         ):
             if time.time() > _round_deadline:
                 logger.warning(f"[agent] round {round_num} stream exceeded wall-clock deadline; cutting off")
                 break
+            if chunk.startswith(":"):
+                yield chunk
+                continue
             # Forward error events from stream_llm to the frontend
             if chunk.startswith("event: error"):
                 yield chunk

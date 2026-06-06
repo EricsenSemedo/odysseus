@@ -51,6 +51,14 @@ from routes.model_routes import (
     _endpoint_settings_using_endpoint,
     _clear_endpoint_settings_for_endpoint,
     _clear_user_pref_endpoint_refs,
+    _runtime_benchmark_candidates,
+    _runtime_benchmark_next_candidate,
+    _runtime_benchmark_score,
+    _ollama_block_count,
+    _ollama_gpu_layer_max,
+    _ollama_layer_metadata,
+    _load_benchmark_state,
+    _store_benchmark_state,
     _PROVIDER_CURATED,
 )
 from src.llm_core import ANTHROPIC_MODELS
@@ -977,6 +985,11 @@ def _route_request():
     )
 
 
+def _route_resp(status=200, *, json_body=None, url="http://localhost:11434/api/generate"):
+    request = httpx.Request("POST", url)
+    return httpx.Response(status, request=request, json=json_body or {})
+
+
 def test_api_models_returns_cached_proxy_models_without_refresh_probe(monkeypatch):
     row = _route_ep(
         "proxy",
@@ -1318,3 +1331,151 @@ def test_manual_refresh_timeout_keeps_cached_models_and_warns(monkeypatch):
     assert db.commits == 0
     assert response.headers["X-Model-Refresh-Status"] == "failed"
     assert "kept cached models" in response.headers["X-Model-Refresh-Warning"]
+
+
+def test_runtime_warm_preserves_existing_settings_when_request_omits_defaults(monkeypatch):
+    ep = _route_ep("ollama", "http://localhost:11434/v1")
+    db = _RouteDb([ep])
+    router = model_routes.setup_model_routes(model_discovery=None)
+    stored = {}
+    posted = {}
+
+    monkeypatch.setattr(model_routes, "ModelEndpoint", _RouteModelEndpoint)
+    monkeypatch.setattr(model_routes, "SessionLocal", lambda: db)
+    monkeypatch.setattr(model_routes, "require_admin", lambda request: None)
+    monkeypatch.setattr(
+        model_routes,
+        "_runtime_settings_for",
+        lambda ep_id, model: {"gpu_layers": 33, "keep_alive": "2h", "warm_on_select": False},
+    )
+
+    def fake_store(ep_id, model, settings):
+        stored.update(settings)
+        return settings
+
+    def fake_post(url, json=None, headers=None, timeout=None, verify=None):
+        posted.update(json or {})
+        return _route_resp(200, json_body={"response": ""}, url=url)
+
+    monkeypatch.setattr(model_routes, "_store_runtime_settings", fake_store)
+    monkeypatch.setattr(model_routes, "is_model_request_active", lambda root, model: False)
+    monkeypatch.setattr(model_routes.httpx, "post", fake_post)
+    monkeypatch.setattr(model_routes.httpx, "get", lambda *a, **k: _route_resp(200, json_body={"models": []}))
+
+    endpoint = _route_endpoint(router, "/api/model-endpoints/{ep_id}/runtime/warm", "POST")
+    result = endpoint(
+        "ollama",
+        model_routes.ModelRuntimeWarmRequest(model="qwen"),
+        _route_request(),
+    )
+
+    assert result["ok"] is True
+    assert posted["keep_alive"] == "2h"
+    assert posted["options"] == {"num_gpu": 33}
+    assert stored == {"gpu_layers": 33, "keep_alive": "2h", "warm_on_select": False}
+
+
+def test_runtime_benchmark_candidates_are_unique_and_clamped():
+    assert _runtime_benchmark_candidates(48, None) == [49, 24, 0]
+    assert _runtime_benchmark_candidates(None, [49, "49", -3, "bad", 12]) == [49, 0, 12]
+
+
+def test_runtime_benchmark_next_candidate_narrows_failed_high_layers():
+    rows = [
+        {"gpu_layers": 49, "ok": False, "score": -1_000_000},
+        {"gpu_layers": 24, "ok": True, "score": 20},
+        {"gpu_layers": 0, "ok": True, "score": 2},
+    ]
+
+    assert _runtime_benchmark_next_candidate(rows, 49, [49, 24, 0]) == 36
+
+
+def test_runtime_benchmark_next_candidate_refines_around_best_speed():
+    rows = [
+        {"gpu_layers": 49, "ok": True, "score": 30},
+        {"gpu_layers": 24, "ok": True, "score": 20},
+        {"gpu_layers": 0, "ok": True, "score": 2},
+    ]
+
+    assert _runtime_benchmark_next_candidate(rows, 49, [49, 24, 0]) == 36
+
+
+def test_runtime_benchmark_next_candidate_stops_when_best_is_bracketed():
+    rows = [
+        {"gpu_layers": 49, "ok": True, "score": 30},
+        {"gpu_layers": 48, "ok": True, "score": 29},
+        {"gpu_layers": 24, "ok": True, "score": 20},
+        {"gpu_layers": 0, "ok": True, "score": 2},
+    ]
+
+    assert _runtime_benchmark_next_candidate(rows, 49, [49, 48, 24, 0]) is None
+
+
+def test_ollama_gpu_layer_max_counts_output_layer():
+    show_data = {"model_info": {"qwen3moe.block_count": 48}}
+
+    assert _ollama_block_count(show_data) == 48
+    assert _ollama_gpu_layer_max(show_data) == 49
+
+
+def test_ollama_gpu_layer_max_is_unknown_without_metadata():
+    assert _ollama_block_count({}) is None
+    assert _ollama_gpu_layer_max({}) is None
+
+
+def test_ollama_layer_metadata_uses_exact_block_count():
+    show_data = {
+        "details": {"family": "qwen3", "parameter_size": "30B", "quantization_level": "Q4_K_M"},
+        "model_info": {"qwen3.block_count": 48},
+    }
+
+    meta = _ollama_layer_metadata(show_data)
+
+    assert meta["block_count"] == 48
+    assert meta["gpu_layer_max"] == 49
+    assert meta["gpu_layer_max_estimated"] is False
+    assert meta["metadata_error"] is None
+    assert meta["architecture"] == "qwen3"
+
+
+def test_ollama_layer_metadata_reports_estimated_fallback_reason():
+    meta = _ollama_layer_metadata({}, "Ollama /api/show returned HTTP 404")
+
+    assert meta["block_count"] is None
+    assert meta["gpu_layer_max"] == 49
+    assert meta["gpu_layer_max_estimated"] is True
+    assert meta["metadata_available"] is False
+    assert meta["metadata_error"] == "Ollama /api/show returned HTTP 404"
+
+
+def test_runtime_benchmark_score_penalizes_vram_more_in_background_mode():
+    row = {
+        "ok": True,
+        "tokens_per_second": 20,
+        "prompt_tokens_per_second": 100,
+        "load_seconds": 10,
+        "vram_gb": 20,
+    }
+
+    assert _runtime_benchmark_score(row, "max_speed") > _runtime_benchmark_score(row, "background_safe")
+    assert _runtime_benchmark_score({"ok": False}, "balanced") < 0
+
+
+def test_store_benchmark_state_scrubs_sensitive_fields(tmp_path, monkeypatch):
+    state_file = tmp_path / "model_runtime_benchmarks.json"
+    monkeypatch.setattr(model_routes, "_MODEL_RUNTIME_BENCHMARK_STATE", state_file)
+
+    _store_benchmark_state("ep1", "qwen", {
+        "status": "completed",
+        "root": "http://localhost:11434/api",
+        "headers": {"Authorization": "Bearer secret"},
+        "best": {"gpu_layers": 12, "api_key": "secret"},
+        "results": [{"ok": True, "tokens_per_second": 42}],
+    })
+
+    saved = _load_benchmark_state()["ep1"]["models"]["qwen"]
+    assert saved["status"] == "completed"
+    assert saved["best"] == {"gpu_layers": 12}
+    assert saved["results"] == [{"ok": True, "tokens_per_second": 42}]
+    assert "root" not in saved
+    assert "headers" not in saved

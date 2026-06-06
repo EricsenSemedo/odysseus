@@ -60,8 +60,7 @@ def normalize_base(url: str) -> str:
 def _detect_provider(url: str) -> str:
     parsed = urlparse(url or "")
     host = parsed.hostname or ""
-    path = (parsed.path or "").rstrip("/")
-    if host.endswith("ollama.com") or (parsed.port == 11434 and (path == "/api" or path.startswith("/api/"))):
+    if host.endswith("ollama.com") or parsed.port == 11434:
         return "ollama"
     if "anthropic.com" in (url or ""):
         return "anthropic"
@@ -73,10 +72,20 @@ def _ollama_api_root(base: str) -> str:
     parsed = urlparse(base)
     host = parsed.hostname or ""
     path = (parsed.path or "").rstrip("/")
+    origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else base
     if path.endswith("/api"):
         return base
+    if path.endswith("/api/chat") or path.endswith("/api/tags") or path.endswith("/api/generate"):
+        return base.rsplit("/", 1)[0]
+    if parsed.port == 11434 and (
+        path.endswith("/v1/chat/completions")
+        or path.endswith("/v1/models")
+        or path.endswith("/v1")
+        or not path
+    ):
+        return origin.rstrip("/") + "/api"
     if host.endswith("ollama.com"):
-        return f"{parsed.scheme}://{parsed.netloc}/api"
+        return origin.rstrip("/") + "/api"
     return base
 
 
@@ -156,6 +165,12 @@ class TestBuildChatUrl:
     def test_ollama_cloud_root_adds_api(self):
         assert build_chat_url("https://ollama.com") == "https://ollama.com/api/chat"
 
+    def test_remote_ollama_v1_base_uses_native_api(self):
+        assert build_chat_url("http://100.94.209.47:11434/v1") == "http://100.94.209.47:11434/api/chat"
+
+    def test_remote_ollama_legacy_chat_url_uses_native_api(self):
+        assert build_chat_url("http://100.94.209.47:11434/v1/chat/completions") == "http://100.94.209.47:11434/api/chat"
+
 
 class TestBuildModelsUrl:
     def test_openai_models(self):
@@ -163,6 +178,9 @@ class TestBuildModelsUrl:
 
     def test_ollama_tags(self):
         assert build_models_url("https://ollama.com/api") == "https://ollama.com/api/tags"
+
+    def test_remote_ollama_v1_models_uses_native_tags(self):
+        assert build_models_url("http://100.94.209.47:11434/v1") == "http://100.94.209.47:11434/api/tags"
 
 
 class TestBuildHeaders:

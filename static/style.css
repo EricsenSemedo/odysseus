@@ -13643,6 +13643,16 @@ body:has(.doc-version-panel:not(.hidden)) .hamburger-btn {
 .mcp-tools-list label:hover {
   background: color-mix(in srgb, var(--fg) 5%, transparent);
 }
+.adm-model-row-wrap {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  border-radius: 4px;
+}
+.adm-model-row-wrap:hover {
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+}
 .mcp-tools-list input[type="checkbox"] {
   accent-color: var(--accent, var(--red));
   margin: 0;
@@ -13698,6 +13708,130 @@ body:has(.doc-version-panel:not(.hidden)) .hamburger-btn {
 }
 .adm-cb-hidden:checked + .adm-check-dot::after {
   transform: translate(-50%, -50%) rotate(-45deg) scale(1);
+}
+.adm-model-runtime-panel {
+  grid-column: 1 / -1;
+  margin: 0 2px 6px 26px;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--border) 85%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--bg) 72%, transparent);
+  font-size: 11px;
+}
+.adm-runtime-status,
+.adm-runtime-row,
+.adm-runtime-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.adm-runtime-status {
+  justify-content: space-between;
+  margin-bottom: 6px;
+  opacity: 0.75;
+}
+.adm-runtime-status.loaded {
+  color: var(--accent, var(--red));
+  opacity: 0.95;
+}
+.adm-runtime-meta-note {
+  margin: -2px 0 6px;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+.adm-runtime-row {
+  margin-top: 6px;
+}
+.adm-model-runtime-panel .adm-runtime-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0;
+  opacity: 0.8;
+}
+.adm-model-runtime-panel input[type="range"] {
+  width: 100%;
+  margin: 7px 0 2px;
+}
+.adm-runtime-slider-labels {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 2px;
+  color: var(--muted, var(--fg-muted));
+  font-size: 10px;
+  line-height: 1.2;
+}
+.adm-runtime-slider-labels span {
+  min-width: 0;
+}
+.adm-runtime-slider-labels span:nth-child(2) {
+  text-align: center;
+}
+.adm-runtime-slider-labels span:last-child {
+  text-align: right;
+}
+.adm-model-runtime-panel select {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 6px;
+  font: inherit;
+}
+.adm-runtime-actions {
+  margin-top: 8px;
+}
+.adm-runtime-bench {
+  margin-top: 8px;
+}
+.adm-runtime-bench-title {
+  font-size: 11px;
+  color: var(--muted, var(--fg-muted));
+  margin: 6px 0;
+}
+.adm-runtime-progress {
+  height: 5px;
+  margin: 6px 0;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--border) 70%, transparent);
+}
+.adm-runtime-progress > div {
+  height: 100%;
+  width: 0;
+  border-radius: inherit;
+  background: var(--accent, var(--red));
+  transition: width 0.2s ease;
+}
+.adm-runtime-bench-table {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--border);
+  font-size: 11px;
+}
+.adm-runtime-bench-table > div {
+  padding: 6px 7px;
+  background: var(--bg);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.adm-runtime-bench-table > .adm-runtime-bench-head {
+  color: var(--muted, var(--fg-muted));
+  background: color-mix(in srgb, var(--bg) 82%, var(--border));
+  font-weight: 600;
+}
+.adm-runtime-bench-table > .best {
+  color: var(--accent, var(--red));
+  font-weight: 600;
 }
 /* Disabled endpoints — dim the row but keep the toggle/delete buttons
    at full opacity so the user can re-enable or remove without squinting. */

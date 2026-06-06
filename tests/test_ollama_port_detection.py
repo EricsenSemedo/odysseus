@@ -1,9 +1,9 @@
-"""Pin path-aware Ollama detection for URLs on port 11434.
+"""Pin Ollama detection for URLs on port 11434.
 
-Port 11434 is Ollama's default, but it is not Ollama-exclusive.
-LM Studio, vLLM, and other OpenAI-compatible servers commonly run on the same
-port. A URL on port 11434 with a /v1 path must remain OpenAI-compatible;
-only explicit /api or /api/... paths (and ollama.com) are native Ollama.
+Odysseus treats port 11434 as native Ollama even when users paste an
+OpenAI-compatible /v1 URL from Ollama docs or proxies. That keeps local and
+tailnet Ollama endpoints on the native /api/chat path where runtime options
+and residency controls are available.
 """
 import pytest
 
@@ -22,32 +22,32 @@ def _stub_dns(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _is_ollama_native_url: /v1 on port 11434 is NOT native Ollama
+# _is_ollama_native_url: /v1 on port 11434 is native Ollama
 # ---------------------------------------------------------------------------
 
-class TestIsOllamaNativeUrlRejectsV1Paths:
-    """Port alone is not enough — /v1 paths are OpenAI-compatible."""
+class TestIsOllamaNativeUrlAcceptsPort11434V1Paths:
+    """Port 11434 URLs are normalized onto Ollama's native API."""
 
     def test_localhost_v1(self):
-        assert not llm_core._is_ollama_native_url("http://localhost:11434/v1")
+        assert llm_core._is_ollama_native_url("http://localhost:11434/v1")
 
     def test_localhost_v1_trailing_slash(self):
-        assert not llm_core._is_ollama_native_url("http://localhost:11434/v1/")
+        assert llm_core._is_ollama_native_url("http://localhost:11434/v1/")
 
     def test_localhost_v1_chat_completions(self):
-        assert not llm_core._is_ollama_native_url("http://localhost:11434/v1/chat/completions")
+        assert llm_core._is_ollama_native_url("http://localhost:11434/v1/chat/completions")
 
     def test_loopback_ip_v1(self):
-        assert not llm_core._is_ollama_native_url("http://127.0.0.1:11434/v1")
+        assert llm_core._is_ollama_native_url("http://127.0.0.1:11434/v1")
 
     def test_named_host_v1(self):
-        assert not llm_core._is_ollama_native_url("http://ollama:11434/v1")
+        assert llm_core._is_ollama_native_url("http://ollama:11434/v1")
 
     def test_lan_ip_v1(self):
-        assert not llm_core._is_ollama_native_url("http://192.168.1.100:11434/v1")
+        assert llm_core._is_ollama_native_url("http://192.168.1.100:11434/v1")
 
     def test_lan_ip_v1_chat_completions(self):
-        assert not llm_core._is_ollama_native_url("http://192.168.1.100:11434/v1/chat/completions")
+        assert llm_core._is_ollama_native_url("http://192.168.1.100:11434/v1/chat/completions")
 
 
 # ---------------------------------------------------------------------------
@@ -75,18 +75,18 @@ class TestIsOllamaNativeUrlAcceptsNativePaths:
 
 
 # ---------------------------------------------------------------------------
-# build_chat_url: port 11434 + /v1 → OpenAI-compatible /chat/completions
+# build_chat_url: port 11434 + /v1 → native /api/chat
 # ---------------------------------------------------------------------------
 
-class TestBuildChatUrlPort11434V1IsOpenAICompat:
+class TestBuildChatUrlPort11434V1IsNativeOllama:
     def test_localhost_v1(self):
-        assert build_chat_url("http://localhost:11434/v1") == "http://localhost:11434/v1/chat/completions"
+        assert build_chat_url("http://localhost:11434/v1") == "http://localhost:11434/api/chat"
 
     def test_loopback_ip_v1(self):
-        assert build_chat_url("http://127.0.0.1:11434/v1") == "http://127.0.0.1:11434/v1/chat/completions"
+        assert build_chat_url("http://127.0.0.1:11434/v1") == "http://127.0.0.1:11434/api/chat"
 
     def test_lan_ip_v1(self):
-        assert build_chat_url("http://192.168.1.100:11434/v1") == "http://192.168.1.100:11434/v1/chat/completions"
+        assert build_chat_url("http://192.168.1.100:11434/v1") == "http://192.168.1.100:11434/api/chat"
 
 
 # ---------------------------------------------------------------------------

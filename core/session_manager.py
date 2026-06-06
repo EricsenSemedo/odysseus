@@ -597,13 +597,40 @@ class SessionManager:
     # ------------------------------------------------------------------
 
     def get_sessions_for_user(self, username: Optional[str] = None) -> Dict[str, Session]:
-        """Return sessions for a specific user (or all if username is None)."""
+        """Return sessions for a specific user (or all cached sessions if username is None).
+
+        The user-scoped list is built from current DB rows, not the in-memory
+        cache. The cache can be stale after owner migrations/renames or after a
+        previous process created an empty session; returning those stale rows
+        makes the UI open chats that /api/chat_stream later rejects in the DB
+        owner check.
+        """
         if username is None:
             return self.sessions
-        return {
-            sid: s for sid, s in self.sessions.items()
-            if s.owner == username
-        }
+        db = None
+        try:
+            db = SessionLocal()
+            rows = db.query(DbSession).filter(
+                DbSession.owner == username,
+                DbSession.archived == False,
+            ).order_by(DbSession.last_accessed.desc()).all()
+            result: Dict[str, Session] = {}
+            for row in rows:
+                session = self._db_to_session_meta(row)
+                if session is None:
+                    continue
+                self.sessions[row.id] = session
+                result[row.id] = session
+            return result
+        except Exception as e:
+            logger.error(f"Error loading sessions for user {username}: {e}")
+            return {
+                sid: s for sid, s in self.sessions.items()
+                if s.owner == username
+            }
+        finally:
+            if db is not None:
+                db.close()
 
     def save_sessions(self):
         """No-op for DB compatibility."""

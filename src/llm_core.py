@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from typing import Optional, Dict, List
 from src.model_context import get_context_length, DEFAULT_CONTEXT
 from urllib.parse import urlparse
+from src.model_runtime import apply_ollama_runtime_payload_options, is_ollama_runtime_url
 
 logger = logging.getLogger(__name__)
 
@@ -65,15 +66,47 @@ _host_fails: Dict[str, int] = {}
 # loses failure counts under concurrent connect errors (issue #659).
 _host_health_lock = threading.Lock()
 _model_activity: Dict[str, float] = {}
+_model_active_counts: Dict[str, int] = {}
+_model_active_lock = threading.Lock()
 
 def _model_activity_key(url: str, model: str) -> str:
     return f"{(url or '').strip()}|{(model or '').strip()}"
+
+def _model_runtime_key(url: str, model: str) -> str:
+    parsed = urlparse(url or "")
+    origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else (url or "").strip().rstrip("/")
+    return f"{origin.lower()}|{(model or '').strip()}"
 
 def note_model_activity(url: str, model: str):
     """Record that a real upstream request used this endpoint/model."""
     if not url or not model:
         return
     _model_activity[_model_activity_key(url, model)] = time.time()
+
+def note_model_request_start(url: str, model: str):
+    if not url or not model:
+        return
+    key = _model_runtime_key(url, model)
+    with _model_active_lock:
+        _model_active_counts[key] = _model_active_counts.get(key, 0) + 1
+
+def note_model_request_end(url: str, model: str):
+    if not url or not model:
+        return
+    key = _model_runtime_key(url, model)
+    with _model_active_lock:
+        count = _model_active_counts.get(key, 0)
+        if count <= 1:
+            _model_active_counts.pop(key, None)
+        else:
+            _model_active_counts[key] = count - 1
+
+def is_model_request_active(url: str, model: str) -> bool:
+    if not url or not model:
+        return False
+    key = _model_runtime_key(url, model)
+    with _model_active_lock:
+        return _model_active_counts.get(key, 0) > 0
 
 def seconds_since_model_activity(url: str, model: str) -> Optional[float]:
     """Seconds since the endpoint/model was last used in this process."""
@@ -160,7 +193,13 @@ ANTHROPIC_MODELS = [
 
 
 def _is_ollama_native_url(url: str) -> bool:
-    """Return True for native Ollama API URLs, including Ollama Cloud."""
+    """Return True for Ollama URLs, including legacy OpenAI-compatible paths.
+
+    Ollama exposes OpenAI-compatible routes under /v1, but runtime controls
+    (warm/unload, keep_alive, num_gpu) are native Ollama concepts. Treat any
+    endpoint on the Ollama port as Ollama so chat and runtime settings use the
+    same provider path.
+    """
     try:
         parsed = urlparse(url or "")
     except Exception:
@@ -169,7 +208,9 @@ def _is_ollama_native_url(url: str) -> bool:
     path = (parsed.path or "").rstrip("/")
     if _host_match(url, "ollama.com"):
         return True
-    local_ollama_host = host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"} or parsed.port == 11434
+    if parsed.port == 11434:
+        return True
+    local_ollama_host = host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
     return local_ollama_host and (path == "/api" or path.startswith("/api/"))
 
 
@@ -178,6 +219,7 @@ def _ollama_api_root(url: str) -> str:
     url = (url or "").strip().rstrip("/")
     parsed = urlparse(url)
     path = (parsed.path or "").rstrip("/")
+    origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else url
     if path.endswith("/api/chat"):
         return url[: -len("/chat")]
     if path.endswith("/api/tags"):
@@ -186,8 +228,15 @@ def _ollama_api_root(url: str) -> str:
         return url[: -len("/generate")]
     if path.endswith("/api"):
         return url
+    if parsed.port == 11434 and (
+        path.endswith("/v1/chat/completions")
+        or path.endswith("/v1/models")
+        or path.endswith("/v1")
+        or not path
+    ):
+        return origin.rstrip("/") + "/api"
     if _host_match(url, "ollama.com"):
-        root = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else "https://ollama.com"
+        root = origin if parsed.scheme and parsed.netloc else "https://ollama.com"
         return root.rstrip("/") + "/api"
     return url
 
@@ -937,11 +986,17 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         if max_tokens and max_tokens > 0:
             tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
             payload[tok_key] = max_tokens
+    apply_ollama_runtime_payload_options(payload, target_url, model)
     try:
+        if is_ollama_runtime_url(target_url):
+            note_model_request_start(target_url, model)
         note_model_activity(target_url, model)
         r = httpx.post(target_url, headers=h, json=payload, timeout=timeout)
     except Exception as e:
         raise HTTPException(502, f"POST {target_url} failed: {e}")
+    finally:
+        if is_ollama_runtime_url(target_url):
+            note_model_request_end(target_url, model)
     if not r.is_success:
         raise HTTPException(502, f"Upstream {target_url} -> {r.status_code}: {r.text}")
     data = r.json()
@@ -1087,59 +1142,67 @@ async def llm_call_async(
         if max_tokens and max_tokens > 0:
             tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
             payload[tok_key] = max_tokens
+    apply_ollama_runtime_payload_options(payload, target_url, model)
 
     if _is_host_dead(target_url):
         raise HTTPException(503, f"Upstream {_host_key(target_url)} marked unreachable (cooldown active)")
 
     call_timeout = httpx.Timeout(connect=3.0, read=float(timeout), write=10.0, pool=5.0)
     attempt = 0
-    while attempt < max_retries:
-        attempt += 1
-        start = time.time()
-        try:
-            note_model_activity(target_url, model)
-            client = _get_http_client()
-            r = await client.post(target_url, headers=h, json=payload, timeout=call_timeout)
-            duration = time.time() - start
-            if not r.is_success:
-                friendly = _format_upstream_error(r.status_code, r.text, target_url)
-                logger.warning(
-                    f"LLM async call to {target_url} failed in {duration:.2f}s "
-                    f"(attempt {attempt}): HTTP {r.status_code} {friendly}"
-                )
-                if r.status_code in (429, 502, 503, 504) and attempt < max_retries:
-                    await asyncio.sleep(LLMConfig.RETRY_DELAY)
-                    continue
-                raise HTTPException(r.status_code, friendly)
-            logger.info(f"LLM async call to {target_url} succeeded in {duration:.2f}s (attempt {attempt})")
-            _clear_host_dead(target_url)
-            data = r.json()
+    active_runtime = is_ollama_runtime_url(target_url)
+    if active_runtime:
+        note_model_request_start(target_url, model)
+    try:
+        while attempt < max_retries:
+            attempt += 1
+            start = time.time()
             try:
-                if provider == "anthropic":
-                    response = _parse_anthropic_response(data)
-                elif provider == "ollama":
-                    response = _parse_ollama_response(data)
-                else:
-                    msg = data["choices"][0]["message"]
-                    response = msg.get("content") or msg.get("reasoning_content") or ""
-                _set_cached_response(cache_key, response)
-                return response
-            except Exception:
-                raise HTTPException(502, f"Unexpected schema from {target_url}: {str(data)[:400]}")
-        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
-            _cooled = _mark_host_dead(target_url)
-            duration = time.time() - start
-            _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"
-            logger.warning(f"LLM async connect to {target_url} failed after {duration:.2f}s: {e}{_tail}")
-            if _cooled or attempt >= max_retries:
-                raise HTTPException(503, f"Cannot reach {_host_key(target_url)}: {e}")
-            await asyncio.sleep(LLMConfig.RETRY_DELAY)
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            duration = time.time() - start
-            logger.warning(f"LLM async call attempt {attempt} failed after {duration:.2f}s: {e}")
-            if attempt >= max_retries:
-                raise HTTPException(502, f"POST {target_url} failed after {max_retries} attempts: {e}")
-            await asyncio.sleep(LLMConfig.RETRY_DELAY)
+                note_model_activity(target_url, model)
+                client = _get_http_client()
+                r = await client.post(target_url, headers=h, json=payload, timeout=call_timeout)
+                duration = time.time() - start
+                if not r.is_success:
+                    friendly = _format_upstream_error(r.status_code, r.text, target_url)
+                    logger.warning(
+                        f"LLM async call to {target_url} failed in {duration:.2f}s "
+                        f"(attempt {attempt}): HTTP {r.status_code} {friendly}"
+                    )
+                    if r.status_code in (429, 502, 503, 504) and attempt < max_retries:
+                        await asyncio.sleep(LLMConfig.RETRY_DELAY)
+                        continue
+                    raise HTTPException(r.status_code, friendly)
+                logger.info(f"LLM async call to {target_url} succeeded in {duration:.2f}s (attempt {attempt})")
+                _clear_host_dead(target_url)
+                data = r.json()
+                try:
+                    if provider == "anthropic":
+                        response = _parse_anthropic_response(data)
+                    elif provider == "ollama":
+                        response = _parse_ollama_response(data)
+                    else:
+                        msg = data["choices"][0]["message"]
+                        response = msg.get("content") or msg.get("reasoning_content") or ""
+                    _set_cached_response(cache_key, response)
+                    return response
+                except Exception:
+                    raise HTTPException(502, f"Unexpected schema from {target_url}: {str(data)[:400]}")
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                _cooled = _mark_host_dead(target_url)
+                duration = time.time() - start
+                _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"
+                logger.warning(f"LLM async connect to {target_url} failed after {duration:.2f}s: {e}{_tail}")
+                if _cooled or attempt >= max_retries:
+                    raise HTTPException(503, f"Cannot reach {_host_key(target_url)}: {e}")
+                await asyncio.sleep(LLMConfig.RETRY_DELAY)
+            except (httpx.RequestError, httpx.HTTPStatusError) as e:
+                duration = time.time() - start
+                logger.warning(f"LLM async call attempt {attempt} failed after {duration:.2f}s: {e}")
+                if attempt >= max_retries:
+                    raise HTTPException(502, f"POST {target_url} failed after {max_retries} attempts: {e}")
+                await asyncio.sleep(LLMConfig.RETRY_DELAY)
+    finally:
+        if active_runtime:
+            note_model_request_end(target_url, model)
 
 async def stream_llm(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,
                      max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
@@ -1204,6 +1267,7 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         if provider == "copilot":
             from src.copilot import apply_request_headers
             apply_request_headers(h, messages_copy)
+    apply_ollama_runtime_payload_options(payload, target_url, model)
 
     # Short connect timeout: a reachable peer answers SYN in <100ms even on
     # Tailscale. 3s is plenty; 30s let one dead upstream wedge the UI.
@@ -1217,6 +1281,9 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
     # ── Native Ollama streaming ──
     if provider == "ollama":
         _ollama_tool_calls: List[Dict] = []
+        active_runtime = is_ollama_runtime_url(target_url)
+        if active_runtime:
+            note_model_request_start(target_url, model)
         try:
             client = _get_http_client()
             async with client.stream('POST', target_url, json=payload, headers=h, timeout=stream_timeout) as r:
@@ -1268,6 +1335,9 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         except Exception as e:
             logger.error(f"Ollama stream error: {e}")
             yield f'event: error\ndata: {json.dumps({"error": str(e), "status": 502})}\n\n'
+        finally:
+            if active_runtime:
+                note_model_request_end(target_url, model)
         return
 
     # ── Anthropic streaming ──
@@ -1396,6 +1466,9 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         return f'data: {json.dumps({"type": "tool_calls", "calls": calls})}\n\n'
 
     try:
+        active_runtime = is_ollama_runtime_url(target_url)
+        if active_runtime:
+            note_model_request_start(target_url, model)
         client = _get_http_client()
         async with client.stream('POST', target_url, json=payload, headers=h, timeout=stream_timeout) as r:
             _clear_host_dead(target_url)
@@ -1589,6 +1662,9 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
     except Exception as e:
         logger.error(f"Stream error: {e}")
         yield f'event: error\ndata: {json.dumps({"error": str(e), "status": 502})}\n\n'
+    finally:
+        if 'active_runtime' in locals() and active_runtime:
+            note_model_request_end(target_url, model)
 
 
 def _summarize_stream_error(err_chunk: Optional[str]) -> str:

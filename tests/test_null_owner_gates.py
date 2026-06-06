@@ -57,6 +57,10 @@ def _null_owner_stubs(monkeypatch):
         sys.modules["src.webhook_manager"] = wm
         monkeypatch.setitem(sys.modules, "src.webhook_manager", wm)
 
+for _stub in ("core.database", "core.auth", "src.endpoint_resolver"):
+    if not getattr(sys.modules.get(_stub), "__file__", None):
+        sys.modules.pop(_stub, None)
+
 from fastapi import HTTPException
 
 

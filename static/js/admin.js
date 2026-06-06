@@ -528,7 +528,7 @@ async function loadEndpoints() {
         // Don't let interactions inside the expanded panel re-fire the
         // expand/collapse handler — the search box was getting closed
         // because clicking it bubbled up to here.
-        if (e.target.closest('.admin-btn-sm, .admin-btn-delete, .mcp-tools-list, .mcp-tools-header, .mcp-tools-search, input, label')) return;
+        if (e.target.closest('.admin-btn-sm, .admin-btn-delete, .mcp-tools-list, .mcp-tools-header, .mcp-tools-search, .adm-model-runtime-panel, input, label')) return;
         const epId = header.dataset.admEpHeader;
         const panel = row.querySelector(`[data-adm-ep-models-panel="${epId}"]`);
         if (!panel) return;
@@ -597,11 +597,15 @@ async function loadEndpoints() {
                 <a href="#" data-ep-select-none="${epId}">None</a>
               </span>
             </div>${warningHtml}${showSearch ? `<input type="search" class="mcp-tools-search" placeholder="Search ${sortedModels.length} models..." data-ep-search="${epId}">` : ''}<div class="mcp-tools-list">` + sortedModels.map(m =>
-              `<label title="${esc(m.id)}" data-ep-model-row data-search="${esc((m.display + ' ' + m.id).toLowerCase())}" class="adm-model-row">
-                <input type="checkbox" class="adm-cb-hidden" data-ep-model-id="${esc(m.id)}" ${!m.is_hidden ? 'checked' : ''}>
-                <span class="adm-check-dot" aria-hidden="true"></span>
-                <span>${esc(m.display)}</span>
-              </label>`
+              `<div title="${esc(m.id)}" data-ep-model-row data-search="${esc((m.display + ' ' + m.id).toLowerCase())}" class="adm-model-row-wrap">
+                <label class="adm-model-row" style="flex:1;min-width:0;">
+                  <input type="checkbox" class="adm-cb-hidden" data-ep-model-id="${esc(m.id)}" ${!m.is_hidden ? 'checked' : ''}>
+                  <span class="adm-check-dot" aria-hidden="true"></span>
+                  <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;">${esc(m.display)}</span>
+                </label>
+                <button type="button" class="admin-btn-sm" data-model-runtime="${esc(m.id)}" data-model-runtime-ep="${epId}" title="Runtime settings">Runtime</button>
+                <div class="adm-model-runtime-panel hidden" data-model-runtime-panel="${esc(m.id)}"></div>
+              </div>`
             ).join('') + '</div>';
             const filterRows = (q) => {
               const needle = q.trim().toLowerCase();
@@ -625,8 +629,20 @@ async function loadEndpoints() {
               });
               _saveEpModelState(epId, panel);
             });
-            panel.querySelectorAll('input[type=checkbox]').forEach(cb => {
+            panel.querySelectorAll('.adm-cb-hidden').forEach(cb => {
               cb.addEventListener('change', () => _saveEpModelState(epId, panel));
+            });
+            panel.querySelectorAll('[data-model-runtime]').forEach(btn => {
+              btn.addEventListener('click', async (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const holder = btn.parentElement?.querySelector('.adm-model-runtime-panel');
+                if (!holder) return;
+                holder.classList.toggle('hidden');
+                if (!holder.classList.contains('hidden')) {
+                  await _loadModelRuntime(btn.dataset.modelRuntimeEp, btn.dataset.modelRuntime, holder);
+                }
+              });
             });
           };
           try {
@@ -645,12 +661,267 @@ async function loadEndpoints() {
   }
 }
 
+function _fmtBytes(n) {
+  const v = Number(n || 0);
+  if (!Number.isFinite(v) || v <= 0) return '';
+  const gb = v / (1024 * 1024 * 1024);
+  return gb >= 1 ? `${gb.toFixed(gb >= 10 ? 1 : 2)} GB` : `${(v / (1024 * 1024)).toFixed(0)} MB`;
+}
+
+function _runtimeStatusText(data) {
+  if (!data || !data.supported) return data?.message || 'Runtime controls unavailable for this endpoint.';
+  if (!data.loaded) return 'Not loaded';
+  const st = data.status || {};
+  const parts = [];
+  if (st.processor) parts.push(st.processor);
+  if (st.size) parts.push(_fmtBytes(st.size));
+  if (st.size_vram) parts.push(`${_fmtBytes(st.size_vram)} VRAM`);
+  if (st.context) parts.push(`ctx ${st.context}`);
+  return parts.join(' · ') || 'Loaded';
+}
+
+function _renderRuntimeBenchmarkResults(holder, out) {
+  const target = holder.querySelector('[data-runtime-bench-results]');
+  if (!target) return;
+  const rows = Array.isArray(out?.results) ? out.results : [];
+  const bestLayers = out?.best?.gpu_layers;
+  if (!rows.length && !out?.status) {
+    target.innerHTML = '';
+    return;
+  }
+  const total = Array.isArray(out?.candidates) ? out.candidates.length : rows.length;
+  const current = Number(out?.current_index || rows.length || 0);
+  const status = out?.status ? String(out.status) : '';
+  const running = status === 'queued' || status === 'running';
+  const message = out?.message || (running ? 'Running benchmark...' : 'Auto tune results');
+  target.innerHTML = `
+    <div class="adm-runtime-bench-title">
+      ${esc(message)}${total ? ` · ${Math.min(current, total)}/${total}` : ''}${out.applied ? ' · applied best' : ''}
+    </div>
+    ${running ? `<div class="adm-runtime-progress"><div style="width:${total ? Math.min(100, Math.round((current / total) * 100)) : 10}%"></div></div>` : ''}
+    ${running ? '<button type="button" class="admin-btn-sm" data-runtime-bench-cancel>Cancel after current test</button>' : ''}
+    ${rows.length ? `<div class="adm-runtime-bench-table">
+        <div class="adm-runtime-bench-head">Layers</div>
+        <div class="adm-runtime-bench-head">Tok/s</div>
+        <div class="adm-runtime-bench-head">Load</div>
+        <div class="adm-runtime-bench-head">VRAM</div>
+        <div class="adm-runtime-bench-head">Score</div>
+        ${rows.map(r => `
+          <div class="${r.gpu_layers === bestLayers ? 'best' : ''}">${esc(String(r.gpu_layers))}${r.gpu_layers === bestLayers ? ' ✓' : ''}</div>
+          <div class="${r.gpu_layers === bestLayers ? 'best' : ''}">${r.ok ? esc(String(r.tokens_per_second || 0)) : 'failed'}</div>
+          <div class="${r.gpu_layers === bestLayers ? 'best' : ''}">${r.ok ? `${esc(String(r.load_seconds || 0))}s` : ''}</div>
+          <div class="${r.gpu_layers === bestLayers ? 'best' : ''}">${r.ok ? esc(_fmtBytes(r.size_vram)) : ''}</div>
+          <div class="${r.gpu_layers === bestLayers ? 'best' : ''}">${esc(String(r.score ?? ''))}</div>
+        `).join('')}
+      </div>` : ''}
+  `;
+}
+
+async function _pollRuntimeBenchmark(epId, modelId, holder, jobId) {
+  const stopStates = new Set(['completed', 'failed', 'cancelled']);
+  while (true) {
+    const res = await fetch(`/api/model-endpoints/${epId}/runtime/benchmark/${jobId}`, { credentials: 'same-origin' });
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(out.detail || 'Auto tune status failed');
+    _renderRuntimeBenchmarkResults(holder, out);
+    const cancelBtn = holder.querySelector('[data-runtime-bench-cancel]');
+    if (cancelBtn && !cancelBtn.dataset.bound) {
+      cancelBtn.dataset.bound = '1';
+      cancelBtn.addEventListener('click', async () => {
+        cancelBtn.disabled = true;
+        cancelBtn.textContent = 'Cancelling...';
+        await fetch(`/api/model-endpoints/${epId}/runtime/benchmark/${jobId}/cancel`, {
+          method: 'POST',
+          credentials: 'same-origin',
+        }).catch(() => {});
+      });
+    }
+    if (stopStates.has(out.status)) {
+      await _loadModelRuntime(epId, modelId, holder);
+      const freshResults = holder.querySelector('[data-runtime-bench-results]');
+      if (freshResults) _renderRuntimeBenchmarkResults(holder, out);
+      return out;
+    }
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+}
+
+function _renderRuntimeControls(epId, modelId, holder, data) {
+  const settings = data.settings || {};
+  const meta = data.metadata || {};
+  const blockCount = Number(meta.block_count || 0);
+  const maxLayers = Number(meta.gpu_layer_max || 0);
+  const hasLayerRange = maxLayers > 0;
+  const hasExactLayerMeta = hasLayerRange && !meta.gpu_layer_max_estimated;
+  const metaNote = hasExactLayerMeta
+    ? `${esc(String(blockCount))} blocks · ${esc(String(maxLayers))} GPU slots`
+    : (hasLayerRange
+      ? `estimated ${esc(String(maxLayers))} GPU slots`
+      : 'layer metadata unavailable');
+  const metaError = meta.metadata_error ? String(meta.metadata_error) : '';
+  const auto = settings.gpu_layers === undefined || settings.gpu_layers === null || String(settings.gpu_layers) === 'auto';
+  const sliderMax = hasLayerRange ? maxLayers : Math.max(1, Number(settings.gpu_layers || 1));
+  const sliderVal = auto ? sliderMax : Math.max(0, Math.min(sliderMax, Number(settings.gpu_layers || 0)));
+  const disabled = data.supported ? '' : 'disabled';
+  const layerDisabled = auto || !data.supported || !hasLayerRange ? 'disabled' : '';
+  holder.innerHTML = `
+    <div class="adm-runtime-status ${data.loaded ? 'loaded' : ''}">
+      <span data-runtime-status-text>${esc(_runtimeStatusText(data))}</span>
+      <span style="opacity:0.45;">${metaNote}</span>
+    </div>
+    ${metaError ? `<div class="adm-runtime-meta-note">${esc(metaError)}</div>` : ''}
+    <div class="adm-runtime-row">
+      <label class="adm-runtime-check"><input type="checkbox" data-runtime-auto ${auto ? 'checked' : ''} ${disabled}> Auto / max GPU</label>
+      <span data-runtime-layer-label>${auto ? 'Auto' : (hasLayerRange ? `${sliderVal}/${sliderMax}${hasExactLayerMeta ? '' : ' est.'}` : 'Unknown')}</span>
+    </div>
+    <input type="range" min="0" max="${sliderMax}" value="${sliderVal}" data-runtime-layers ${layerDisabled}>
+    <div class="adm-runtime-slider-labels">
+      <span>CPU-heavy</span>
+      <span>Balanced</span>
+      <span>GPU-heavy</span>
+    </div>
+    <div class="adm-runtime-row">
+      <label>Keep alive</label>
+      <select data-runtime-keepalive ${disabled}>
+        ${['5m', '15m', '30m', '1h', '-1'].map(v => `<option value="${v}" ${String(settings.keep_alive || '30m') === v ? 'selected' : ''}>${v === '-1' ? 'Until unloaded' : v}</option>`).join('')}
+      </select>
+      <label class="adm-runtime-check"><input type="checkbox" data-runtime-warm-select ${settings.warm_on_select !== false ? 'checked' : ''} ${disabled}> Warm on select</label>
+    </div>
+    <div class="adm-runtime-actions">
+      <button type="button" class="admin-btn-sm" data-runtime-save ${disabled}>Save</button>
+      <button type="button" class="admin-btn-sm" data-runtime-warm ${disabled}>Warm</button>
+      <button type="button" class="admin-btn-sm" data-runtime-unload ${disabled}>Unload</button>
+      <button type="button" class="admin-btn-sm" data-runtime-refresh>Refresh</button>
+    </div>
+    <div class="adm-runtime-row">
+      <label>Auto tune</label>
+      <select data-runtime-bench-mode ${disabled}>
+        <option value="balanced">Balanced</option>
+        <option value="max_speed">Max speed</option>
+        <option value="leave_vram">Leave VRAM free</option>
+        <option value="background_safe">Background safe</option>
+      </select>
+      <button type="button" class="admin-btn-sm" data-runtime-benchmark ${disabled}>Run & apply</button>
+    </div>
+    <div class="adm-runtime-bench" data-runtime-bench-results></div>
+    ${!data.supported ? `<div class="admin-error" style="font-size:11px;margin-top:6px;">${esc(data.message || 'Unsupported endpoint')}</div>` : ''}
+  `;
+
+  const autoCb = holder.querySelector('[data-runtime-auto]');
+  const slider = holder.querySelector('[data-runtime-layers]');
+  const layerLabel = holder.querySelector('[data-runtime-layer-label]');
+  const syncLayer = () => {
+    const isAuto = !!autoCb?.checked;
+    if (slider) slider.disabled = isAuto || !data.supported || !hasLayerRange;
+    if (layerLabel) layerLabel.textContent = isAuto ? 'Auto' : (hasLayerRange ? `${slider?.value || 0}/${sliderMax}${hasExactLayerMeta ? '' : ' est.'}` : 'Unknown');
+  };
+  autoCb?.addEventListener('change', syncLayer);
+  slider?.addEventListener('input', syncLayer);
+  if (data.benchmark) _renderRuntimeBenchmarkResults(holder, data.benchmark);
+
+  const readSettings = () => ({
+    model: modelId,
+    gpu_layers: autoCb?.checked ? 'auto' : Number(slider?.value || 0),
+    keep_alive: holder.querySelector('[data-runtime-keepalive]')?.value || '30m',
+    warm_on_select: !!holder.querySelector('[data-runtime-warm-select]')?.checked,
+  });
+
+  const setBusy = (busy, text) => {
+    holder.querySelectorAll('button').forEach(b => { b.disabled = busy; });
+    const st = holder.querySelector('[data-runtime-status-text]');
+    if (st && text) st.textContent = text;
+  };
+
+  holder.querySelector('[data-runtime-save]')?.addEventListener('click', async () => {
+    setBusy(true, 'Saving...');
+    try {
+      const res = await fetch(`/api/model-endpoints/${epId}/runtime/settings`, {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(readSettings()),
+      });
+      if (!res.ok) {
+        const out = await res.json().catch(() => ({}));
+        throw new Error(out.detail || out.error || out.message || 'Save failed');
+      }
+      await _loadModelRuntime(epId, modelId, holder);
+    } catch (e) { setBusy(false, e.message || 'Save failed'); }
+  });
+  holder.querySelector('[data-runtime-warm]')?.addEventListener('click', async () => {
+    setBusy(true, 'Warming...');
+    try {
+      const res = await fetch(`/api/model-endpoints/${epId}/runtime/warm`, {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(readSettings()),
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(out.detail || 'Warm failed');
+      _renderRuntimeControls(epId, modelId, holder, out.runtime || out);
+    } catch (e) {
+      setBusy(false, e.message || 'Warm failed');
+    }
+  });
+  holder.querySelector('[data-runtime-unload]')?.addEventListener('click', async () => {
+    setBusy(true, 'Unloading...');
+    try {
+      const res = await fetch(`/api/model-endpoints/${epId}/runtime/unload`, {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: modelId }),
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(out.detail || 'Unload failed');
+      _renderRuntimeControls(epId, modelId, holder, out.runtime || out);
+    } catch (e) {
+      setBusy(false, e.message || 'Unload failed');
+    }
+  });
+  holder.querySelector('[data-runtime-benchmark]')?.addEventListener('click', async () => {
+    setBusy(true, 'Auto tuning layers...');
+    const results = holder.querySelector('[data-runtime-bench-results]');
+    if (results) results.innerHTML = '<div class="adm-runtime-bench-title">Starting benchmark...</div>';
+    try {
+      const res = await fetch(`/api/model-endpoints/${epId}/runtime/benchmark`, {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: modelId,
+          mode: holder.querySelector('[data-runtime-bench-mode]')?.value || 'balanced',
+          keep_alive: holder.querySelector('[data-runtime-keepalive]')?.value || '30m',
+          apply_best: true,
+        }),
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(out.detail || 'Auto tune failed');
+      _renderRuntimeBenchmarkResults(holder, out);
+      await _pollRuntimeBenchmark(epId, modelId, holder, out.job_id);
+    } catch (e) {
+      setBusy(false, e.message || 'Auto tune failed');
+      if (results) results.innerHTML = `<div class="admin-error" style="font-size:11px;">${esc(e.message || 'Auto tune failed')}</div>`;
+    }
+  });
+  holder.querySelector('[data-runtime-refresh]')?.addEventListener('click', () => _loadModelRuntime(epId, modelId, holder));
+}
+
+async function _loadModelRuntime(epId, modelId, holder) {
+  holder.innerHTML = '<span style="opacity:0.55;font-size:11px;">Loading runtime...</span>';
+  try {
+    const res = await fetch(`/api/model-endpoints/${epId}/runtime?model=${encodeURIComponent(modelId)}`, { credentials: 'same-origin' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Failed to load runtime');
+    _renderRuntimeControls(epId, modelId, holder, data);
+  } catch (e) {
+    holder.innerHTML = `<span class="admin-error" style="font-size:11px;">${esc(e.message || 'Failed to load runtime')}</span>`;
+  }
+}
+
 async function _saveEpModelState(epId, panel) {
   const hidden = [];
-  panel.querySelectorAll('input[type=checkbox]').forEach(cb => {
+  panel.querySelectorAll('.adm-cb-hidden').forEach(cb => {
     if (!cb.checked) hidden.push(cb.dataset.epModelId);
   });
-  const total = panel.querySelectorAll('input[type=checkbox]').length;
+  const total = panel.querySelectorAll('.adm-cb-hidden').length;
   try {
     await fetch(`/api/model-endpoints/${epId}/models`, {
       method: 'PATCH',

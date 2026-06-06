@@ -36,7 +36,9 @@ import createResearchSynapse from './researchSynapse.js';
   // recovery (which fired only on visibilitychange and silently reloaded).
   let _stallWatchdog = null;
   let _stallBannerShown = false;
+  let _orphanStreamCheckInFlight = false;
   const STALL_THRESHOLD_MS = 60000;
+  const HEADER_WAIT_NOTICE_MS = 10000;
   let _sendInFlight = false;   // covers the window from click → streaming start
   let _displayOverride = null; // Override visible user bubble text (hides injected prompts)
   let _hideUserBubble = false; // Skip user bubble entirely (e.g. continue after stop)
@@ -91,6 +93,16 @@ import createResearchSynapse from './researchSynapse.js';
   function hasActiveStream(sessionId) {
     return _streamSessionId === sessionId || _backgroundStreams.has(sessionId) ||
            _resumingStreams.has(sessionId);
+  }
+  function _clearCompletedStreamUi(sessionId) {
+    if (sessionId && _streamSessionId && _streamSessionId !== sessionId) return;
+    _streamSessionId = null;
+    currentAbort = null;
+    currentSpinner = null;
+    document.querySelectorAll('.msg-ai.streaming,.agent-thread.streaming').forEach((node) => {
+      node.classList.remove('streaming');
+    });
+    updateSubmitButton('idle', document.querySelector('.send-btn'));
   }
 
   // Sources box builder and toggleSources are now in chatRenderer.js
@@ -529,12 +541,19 @@ import createResearchSynapse from './researchSynapse.js';
     let timedOut = false;
     let processingProbeTimer = null;
     let processingProbeAbort = null;
+    let responseHeadersReceived = false;
+    let headerWaitTimer = null;
+    let headerWaitInterval = null;
     let _renderStream = () => {};
     let _cancelThinkingTimer = () => {};
     let _removeThinkingSpinner = () => {};
     let timeoutId = null;
     let responseTimeoutCleared = false;
     let clearResponseTimeout = () => {};
+    const clearHeaderWait = () => {
+      if (headerWaitTimer) { clearTimeout(headerWaitTimer); headerWaitTimer = null; }
+      if (headerWaitInterval) { clearInterval(headerWaitInterval); headerWaitInterval = null; }
+    };
     const clearProcessingProbe = () => {
       if (processingProbeTimer) {
         clearTimeout(processingProbeTimer);
@@ -928,6 +947,23 @@ import createResearchSynapse from './researchSynapse.js';
       box.appendChild(holder);
       uiModule.scrollHistory();
 
+      headerWaitTimer = setTimeout(() => {
+        if (responseHeadersReceived || !spinner || !spinner.element || abortCtrl.signal.aborted) return;
+        const startedAt = Date.now();
+        const modeLabel = el('web-toggle').checked && !_isAgent
+          ? 'web search / context'
+          : 'server';
+        spinner.updateMessage(`Waiting for ${modeLabel} to start streaming`);
+        headerWaitInterval = setInterval(() => {
+          if (responseHeadersReceived || !spinner || !spinner.element || abortCtrl.signal.aborted) {
+            clearHeaderWait();
+            return;
+          }
+          const secs = Math.floor((Date.now() - startedAt + HEADER_WAIT_NOTICE_MS) / 1000);
+          spinner.updateMessage(`Still waiting for ${modeLabel} (${secs}s)`);
+        }, 5000);
+      }, HEADER_WAIT_NOTICE_MS);
+
       const enableResearchBtn = () => {
         if (!researchBtn) return;
         researchBtn.disabled = false;
@@ -954,6 +990,8 @@ import createResearchSynapse from './researchSynapse.js';
         headers: { 'X-Tz-Offset': String(_tzOffsetMin), 'X-Tz-Name': _tzName },
         signal: abortCtrl.signal
       });
+      responseHeadersReceived = true;
+      clearHeaderWait();
       
       if (!res.ok) {
         clearResponseTimeout();
@@ -1303,6 +1341,9 @@ import createResearchSynapse from './researchSynapse.js';
               });
               if (sessionModule && sessionModule.markStreaming) {
                 sessionModule.markStreaming(streamSessionId);
+              }
+              if (_streamSessionId === streamSessionId) {
+                _streamSessionId = null;
               }
             }
 
@@ -1959,6 +2000,12 @@ import createResearchSynapse from './researchSynapse.js';
                   var bgM = _backgroundStreams.get(streamSessionId);
                   if (bgM) bgM.metrics = json.data;
                   continue;
+                }
+
+              } else if (json.type === 'model_status') {
+                if (_isBg) continue;
+                if (spinner && spinner.element) {
+                  spinner.updateMessage(json.message || 'Loading model');
                 }
 
               } else if (json.type === 'message_saved') {
@@ -2727,6 +2774,22 @@ import createResearchSynapse from './researchSynapse.js';
             return;
           }
 
+          if (abortReason === 'orphaned') {
+            const orphanedMsg = 'No active backend stream was found. The stuck request was cleared; try again.';
+            if (holder && !accumulated) {
+              holder.querySelector('.body').innerHTML =
+                `<div style="color: var(--color-error); font-style: italic; padding: 4px 0;">[${orphanedMsg}]</div>`;
+            } else if (holder && accumulated) {
+              const orphanedNote = document.createElement('div');
+              orphanedNote.className = 'stopped-indicator';
+              orphanedNote.innerHTML =
+                `<span style="color: var(--color-error);">[${orphanedMsg}]</span>`;
+              holder.querySelector('.body').appendChild(orphanedNote);
+            }
+            currentAbort = null;
+            return;
+          }
+
           // User-initiated stop (or browser navigation abort).
           // Stopped before any text arrived — keep the bubble as a
           // "Cancelled by user" record (so it survives a refresh).
@@ -2817,6 +2880,7 @@ import createResearchSynapse from './researchSynapse.js';
       }
     } finally {
       clearResponseTimeout();
+      if (typeof clearHeaderWait === 'function') clearHeaderWait();
       clearProcessingProbe();
       // Streaming done — let screen readers announce the settled response.
       const _chatLogDone = document.getElementById('chat-history');
@@ -2828,8 +2892,48 @@ import createResearchSynapse from './researchSynapse.js';
         if (_rToggleCleanup) _rToggleCleanup.classList.remove('research-running');
       }
 
+      let _serverStillStreaming = false;
+      if (!_streamSawDone && streamSessionId && sessionModule.getCurrentSessionId() === streamSessionId) {
+        try {
+          const statusRes = await fetch(`${API_BASE}/api/chat/stream_status/${encodeURIComponent(streamSessionId)}`);
+          if (statusRes.ok) {
+            const statusJson = await statusRes.json().catch(() => ({}));
+            _serverStillStreaming = statusJson.status === 'streaming';
+          }
+        } catch (_) {}
+      }
+
+      if (_serverStillStreaming) {
+        _streamSessionId = streamSessionId;
+        isStreaming = true;
+        _lastReaderActivity = Date.now();
+        _startStallWatchdog();
+        if (currentSpinner && currentSpinner.element) {
+          currentSpinner.updateMessage('Waiting for model stream');
+        }
+        const pollServerCompletion = async (attempt = 0) => {
+          if (_streamSessionId !== streamSessionId || sessionModule.getCurrentSessionId() !== streamSessionId) return;
+          try {
+            const statusRes = await fetch(`${API_BASE}/api/chat/stream_status/${encodeURIComponent(streamSessionId)}`);
+            if (statusRes.status === 404) {
+              _clearCompletedStreamUi(streamSessionId);
+              return;
+            }
+            if (statusRes.ok && attempt < 120) {
+              setTimeout(() => { pollServerCompletion(attempt + 1); }, 5000);
+            } else if (attempt >= 120) {
+              _clearCompletedStreamUi(streamSessionId);
+              if (uiModule?.showToast) {
+                uiModule.showToast('Server stream polling timed out. Try again.', 5000);
+              }
+            }
+          } catch (_) {}
+        };
+        setTimeout(() => { pollServerCompletion(); }, 5000);
+      }
+
       // Only reset UI state if still on the stream's session and was never backgrounded
-      const _isBgFinally = (sessionModule.getCurrentSessionId() !== streamSessionId) || _backgroundStreams.has(streamSessionId);
+      const _isBgFinally = (sessionModule.getCurrentSessionId() !== streamSessionId) || _backgroundStreams.has(streamSessionId) || _serverStillStreaming;
 
       if (!_isBgFinally) {
         // Reset button to idle state
@@ -2905,6 +3009,15 @@ import createResearchSynapse from './researchSynapse.js';
       if (_webLockRelease) {
         _webLockRelease();
         _webLockRelease = null;
+      }
+
+      // The reader for this foreground stream is done (success, error, stop,
+      // or early HTTP failure). Clear the session marker so callers like
+      // hasActiveStream() don't keep treating the chat as live after the UI was
+      // reset. Background streams are tracked separately in _backgroundStreams.
+      if (_streamSessionId === streamSessionId && !_backgroundStreams.has(streamSessionId) && !_serverStillStreaming) {
+        _streamSessionId = null;
+        currentAbort = null;
       }
 
       // Refresh session list after a delay (picks up auto-generated names)
@@ -3032,11 +3145,63 @@ import createResearchSynapse from './researchSynapse.js';
     if (uiModule.scrollHistory) uiModule.scrollHistory();
   }
   function _startStallWatchdog() {
-    // Disabled: the server-side stall detector / auto-continue (agent
-    // loop-breaker) handles quiet/stalled streams now, so the manual
-    // "Quiet for Nm — still working?" banner is redundant (and annoying).
     if (_stallWatchdog) { clearInterval(_stallWatchdog); _stallWatchdog = null; }
     _removeStallBanner();
+    _lastReaderActivity = Date.now();
+    _stallWatchdog = setInterval(() => {
+      if (!isStreaming) {
+        _stopStallWatchdog();
+        return;
+      }
+      const quietMs = Date.now() - (_lastReaderActivity || Date.now());
+      const quietSecs = Math.floor(quietMs / 1000);
+      if (currentSpinner && currentSpinner.element && quietMs > 15000 && quietMs < STALL_THRESHOLD_MS) {
+        const label = quietSecs >= 30
+          ? `Still waiting for activity (${quietSecs}s)`
+          : 'Waiting for first token';
+        currentSpinner.updateMessage(label);
+      }
+      if (
+        quietMs >= 30000 &&
+        currentAbort &&
+        !currentAbort.signal.aborted &&
+        _streamSessionId &&
+        !_orphanStreamCheckInFlight
+      ) {
+        _orphanStreamCheckInFlight = true;
+        fetch(`${API_BASE}/api/chat/stream_status/${encodeURIComponent(_streamSessionId)}`)
+          .then((res) => {
+            if (res.ok) {
+              _lastReaderActivity = Date.now();
+              _stallBannerShown = false;
+              _removeStallBanner();
+              if (currentSpinner && currentSpinner.element) {
+                currentSpinner.updateMessage('Waiting for model stream');
+              }
+              return;
+            }
+            if (res.status === 404) {
+              const hasVisibleStreaming = !!document.querySelector('.msg-ai.streaming,.agent-thread.streaming');
+              if (
+                currentAbort &&
+                !currentAbort.signal.aborted &&
+                !currentAccumulated &&
+                hasVisibleStreaming
+              ) {
+                currentAbort._reason = 'orphaned';
+                currentAbort.abort();
+                return;
+              }
+              _clearCompletedStreamUi(_streamSessionId);
+            }
+          })
+          .catch(() => {})
+          .finally(() => { _orphanStreamCheckInFlight = false; });
+      }
+      if (quietMs >= STALL_THRESHOLD_MS && !_stallBannerShown && !_orphanStreamCheckInFlight) {
+        _showStallBanner(quietSecs);
+      }
+    }, 5000);
   }
   function _stopStallWatchdog() {
     if (_stallWatchdog) { clearInterval(_stallWatchdog); _stallWatchdog = null; }
@@ -3119,6 +3284,7 @@ import createResearchSynapse from './researchSynapse.js';
     }
     // Clear local state WITHOUT aborting the fetch
     currentAbort = null;
+    if (_streamSessionId === sessionId) _streamSessionId = null;
     isStreaming = false;
     currentHolder = null;
     currentAccumulated = '';

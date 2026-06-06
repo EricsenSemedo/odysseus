@@ -49,8 +49,8 @@ class TestDetectProvider:
         ("https://api.x.ai/v1", "openai"),
         ("https://api.deepseek.com", "openai"),
         ("https://generativelanguage.googleapis.com/v1beta/openai", "openai"),
-        # Ollama's OpenAI-compatible /v1 surface is generic, not native ollama.
-        ("http://localhost:11434/v1", "openai"),
+        # Port 11434 is normalized to native Ollama even when /v1 is pasted.
+        ("http://localhost:11434/v1", "ollama"),
     ])
     def test_known_providers(self, url, expected):
         assert _detect_provider(url) == expected

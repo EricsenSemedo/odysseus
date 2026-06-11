@@ -16,7 +16,7 @@ for mod in [
 
 import pytest
 import src.agent_tools
-from src.tool_parsing import parse_tool_blocks
+from src.tool_parsing import parse_tool_blocks, strip_tool_blocks
 from src.tool_schemas import function_call_to_tool_block
 from src.tool_execution import execute_tool_block
 from types import SimpleNamespace
@@ -61,3 +61,52 @@ def test_google_search_mapping():
     assert block is not None
     assert block.tool_type == "web_search"
     assert block.content == "testing google search string"
+
+
+def test_legacy_function_tag_manage_notes_parses():
+    """Some local models leak <function=...> tags instead of native tool_calls."""
+    text = """I'll create a note.
+
+<function=manage_notes>
+<parameter=action>
+create
+</parameter>
+<parameter=title>
+Test Note
+</parameter>
+<parameter=content>
+This is a test note.
+</parameter>
+</function></tool_call>"""
+
+    blocks = parse_tool_blocks(text)
+
+    assert len(blocks) == 1
+    assert blocks[0].tool_type == "manage_notes"
+    assert '"action": "create"' in blocks[0].content
+    assert '"title": "Test Note"' in blocks[0].content
+
+
+def test_legacy_function_tag_web_fetch_parses_alias_content():
+    text = """<function=web_fetch>
+<parameter=url>
+toonsync.io
+</parameter>
+</function></tool_call>"""
+
+    blocks = parse_tool_blocks(text)
+
+    assert len(blocks) == 1
+    assert blocks[0].tool_type == "web_fetch"
+    assert blocks[0].content == '{"url": "toonsync.io"}'
+
+
+def test_legacy_function_tag_strips_from_visible_text():
+    text = """Before
+<function=manage_notes>
+<parameter=action>create</parameter>
+<parameter=title>Test Note</parameter>
+</function></tool_call>
+After"""
+
+    assert strip_tool_blocks(text) == "Before\n\nAfter"

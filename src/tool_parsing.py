@@ -84,6 +84,19 @@ def _normalize_dsml(text: str) -> str:
     t = re.sub(rf"<\s*/\s*{_DSML_PIPES}\s*DSML\s*{_DSML_PIPES}\s*parameter\s*>", "</parameter>", t, flags=re.IGNORECASE)
     return t
 
+# Pattern 6: legacy pseudo-function tags emitted by some local models:
+#   <function=manage_notes>
+#     <parameter=action>create</parameter>
+#   </function></tool_call>
+_FUNCTION_TAG_RE = re.compile(
+    r"<function=([\w.-]+)>\s*([\s\S]*?)</function>\s*(?:</tool_call>)?",
+    re.IGNORECASE,
+)
+_FUNCTION_PARAM_RE = re.compile(
+    r"<parameter=([\w.-]+)>\s*([\s\S]*?)</parameter>",
+    re.IGNORECASE,
+)
+
 # Map model tool names to our tool types
 _TOOL_NAME_MAP = {
     "shell": "bash",
@@ -329,6 +342,25 @@ def _parse_tool_code_block(raw: str) -> Optional[ToolBlock]:
     return None
 
 
+def _parse_function_tag(fn_match) -> Optional[ToolBlock]:
+    """Parse legacy <function=tool><parameter=name>value</parameter> tags.
+
+    Some OpenAI-compatible local model templates leak this pseudo-markup as
+    plain text instead of native tool_calls. Route it through the canonical
+    converter so aliases and per-tool argument shaping stay in one place.
+    """
+    tool_name = fn_match.group(1).lower().replace("-", "_")
+    body = fn_match.group(2)
+    params = {
+        pm.group(1): pm.group(2).strip()
+        for pm in _FUNCTION_PARAM_RE.finditer(body)
+    }
+    if not params:
+        return None
+    from src.tool_schemas import function_call_to_tool_block
+    return function_call_to_tool_block(tool_name, json.dumps(params))
+
+
 def parse_tool_blocks(text: str) -> List[ToolBlock]:
     """Extract executable tool blocks from LLM response text.
 
@@ -393,6 +425,13 @@ def parse_tool_blocks(text: str) -> List[ToolBlock]:
             if block:
                 blocks.append(block)
 
+    # Pattern 6: legacy <function=tool> tags
+    if not blocks:
+        for m in _FUNCTION_TAG_RE.finditer(text):
+            block = _parse_function_tag(m)
+            if block:
+                blocks.append(block)
+
     return blocks
 
 
@@ -405,6 +444,7 @@ def strip_tool_blocks(text: str) -> str:
     cleaned = _TOOL_CALL_RE.sub('', cleaned)
     cleaned = _XML_TOOL_CALL_RE.sub('', cleaned)
     cleaned = _TOOL_CODE_RE.sub('', cleaned)
+    cleaned = _FUNCTION_TAG_RE.sub('', cleaned)
     # Strip bare <invoke> blocks not wrapped in <tool_call>
     cleaned = re.sub(r'<invoke\s+name=["\'].*?</invoke>', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)

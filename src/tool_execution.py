@@ -305,18 +305,11 @@ def _resolve_tool_path_in_workspace(workspace: str, raw_path: str) -> str:
             raise ValueError(f"path '{raw_path}' is outside the workspace ({workspace})")
     return resolved
 
-# Bash + python tools used to share a single 60s timeout. That's
-# enough for one-shot commands but starves real workloads (pip
-# install, ffmpeg conversions, etc.) — and worse, the agent saw the
-# 60s timeout and went silent because it had nothing to report.
-# The new default is intentionally generous: long enough that real
-# work isn't killed mid-flight, but bounded so a runaway process
-# (infinite loop, hung connect, etc.) eventually frees the worker.
-# The user can cancel sooner via the chat stop button — when the
-# SSE stream is torn down, the asyncio task running the subprocess
-# gets cancelled and the subprocess is killed by the finally block.
-DEFAULT_BASH_TIMEOUT = 60 * 60     # 1 hour
-DEFAULT_PYTHON_TIMEOUT = 60 * 60
+# Foreground bash/python tool calls must stay short. The agent prompt tells the
+# model "60s timeout per tool"; commands that may run longer should use the
+# explicit `#!bg` path below so the chat stream is not pinned on a hung process.
+DEFAULT_BASH_TIMEOUT = 60
+DEFAULT_PYTHON_TIMEOUT = 60
 
 # How often to push a progress event while a long-running subprocess
 # is still in flight. The frontend cares about "alive" more than

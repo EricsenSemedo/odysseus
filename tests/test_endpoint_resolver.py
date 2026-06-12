@@ -1,120 +1,15 @@
-"""Tests for endpoint_resolver — pure functions tested directly to avoid import pollution."""
+"""Tests for endpoint_resolver — pure functions tested directly."""
 import json
-import re
-from urllib.parse import urlparse
 
-
-# Copy the pure functions to test them without importing the full module.
-# This avoids module cache conflicts with other test files that mock dependencies.
-
-_NON_CHAT_MODEL = (
-    "text-embedding", "embedding", "tts-", "whisper", "dall-e",
-    "moderation", "rerank", "reranker", "clip", "stable-diffusion",
+from src.endpoint_resolver import (
+    _first_chat_model,
+    _endpoint_hidden_models,
+    _endpoint_enabled_models,
+    normalize_base,
+    build_chat_url,
+    build_models_url,
+    build_headers,
 )
-
-
-def _first_chat_model(models):
-    for m in (models or []):
-        if not any(p in str(m).lower() for p in _NON_CHAT_MODEL):
-            return m
-    return (models[0] if models else None)
-
-
-def _endpoint_cached_models(ep) -> list:
-    raw = getattr(ep, "cached_models", None) or getattr(ep, "models", None)
-    if not raw:
-        return []
-    try:
-        models = json.loads(raw) if isinstance(raw, str) else raw
-    except Exception:
-        return []
-    return models if isinstance(models, list) else []
-
-
-def _endpoint_hidden_models(ep) -> set:
-    raw = getattr(ep, "hidden_models", None)
-    if not raw:
-        return set()
-    try:
-        hidden = json.loads(raw) if isinstance(raw, str) else raw
-    except Exception:
-        return set()
-    return set(hidden) if isinstance(hidden, list) else set()
-
-
-def _endpoint_enabled_models(ep) -> list:
-    hidden = _endpoint_hidden_models(ep)
-    return [m for m in _endpoint_cached_models(ep) if m not in hidden]
-
-def normalize_base(url: str) -> str:
-    url = (url or "").strip().rstrip("/")
-    for suffix in ["/models", "/chat/completions", "/completions", "/v1/messages"]:
-        if url.endswith(suffix):
-            url = url[: -len(suffix)].rstrip("/")
-    for suffix in ["/chat", "/tags", "/generate"]:
-        if url.endswith("/api" + suffix):
-            url = url[: -len(suffix)].rstrip("/")
-    return url
-
-
-def _detect_provider(url: str) -> str:
-    parsed = urlparse(url or "")
-    host = parsed.hostname or ""
-    if host.endswith("ollama.com") or parsed.port == 11434:
-        return "ollama"
-    if "anthropic.com" in (url or ""):
-        return "anthropic"
-    return "openai"
-
-
-def _ollama_api_root(base: str) -> str:
-    base = (base or "").strip().rstrip("/")
-    parsed = urlparse(base)
-    host = parsed.hostname or ""
-    path = (parsed.path or "").rstrip("/")
-    origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else base
-    if path.endswith("/api"):
-        return base
-    if path.endswith("/api/chat") or path.endswith("/api/tags") or path.endswith("/api/generate"):
-        return base.rsplit("/", 1)[0]
-    if parsed.port == 11434 and (
-        path.endswith("/v1/chat/completions")
-        or path.endswith("/v1/models")
-        or path.endswith("/v1")
-        or not path
-    ):
-        return origin.rstrip("/") + "/api"
-    if host.endswith("ollama.com"):
-        return origin.rstrip("/") + "/api"
-    return base
-
-
-def build_chat_url(base: str) -> str:
-    provider = _detect_provider(base)
-    if provider == "anthropic":
-        host = urlparse(base).hostname or ""
-        if host.endswith("anthropic.com") and base.rstrip("/").endswith("/v1"):
-            base = base.rstrip("/")[:-3].rstrip("/")
-        return base + "/v1/messages"
-    if provider == "ollama":
-        return _ollama_api_root(base) + "/chat"
-    return base + "/chat/completions"
-
-
-def build_models_url(base: str) -> str:
-    provider = _detect_provider(base)
-    if provider == "ollama":
-        return _ollama_api_root(base) + "/tags"
-    return base + "/models"
-
-
-def build_headers(api_key, base: str) -> dict:
-    if not api_key:
-        return {}
-    provider = _detect_provider(base)
-    if provider == "anthropic":
-        return {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
-    return {"Authorization": f"Bearer {api_key}"}
 
 
 class TestNormalizeBase:
@@ -165,8 +60,11 @@ class TestBuildChatUrl:
     def test_ollama_cloud_root_adds_api(self):
         assert build_chat_url("https://ollama.com") == "https://ollama.com/api/chat"
 
-    def test_remote_ollama_v1_base_uses_native_api(self):
-        assert build_chat_url("http://100.94.209.47:11434/v1") == "http://100.94.209.47:11434/api/chat"
+    def test_ollama_bare_url_adds_api(self):
+        assert build_chat_url("http://nas:11434") == "http://nas:11434/api/chat"
+
+    def test_ollama_v1_uses_native_api(self):
+        assert build_chat_url("http://nas:11434/v1") == "http://nas:11434/api/chat"
 
     def test_remote_ollama_legacy_chat_url_uses_native_api(self):
         assert build_chat_url("http://100.94.209.47:11434/v1/chat/completions") == "http://100.94.209.47:11434/api/chat"

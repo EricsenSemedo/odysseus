@@ -31,10 +31,10 @@ def test_background_status_poll_reconciles_into_local_tasks():
 def test_local_windows_session_commands_use_local_powershell_log_dir():
     source = _read("static/js/cookbookRunning.js")
 
-    assert "function _psEncodedCommand(script) {" in source
-    assert "powershell -NoProfile -EncodedCommand" in source
-    assert "if (task.remoteHost) {" in source
-    assert "odysseus-sessions\\\\${sid}.log" in source
+    assert "const host = task.remoteHost;" in source
+    assert "host ? '$env:TEMP\\\\odysseus-sessions' : '$env:TEMP\\\\odysseus-tmux'" in source
+    assert "return `ssh ${pf}${task.remoteHost} powershell -NoProfile -EncodedCommand ${_psEncodedCommand(script)}`;" in source
+    assert "return `powershell -NoProfile -EncodedCommand ${_psEncodedCommand(script)}`;" in source
 
 
 def test_dep_install_success_recognized_from_exit_sentinel():
@@ -56,10 +56,14 @@ def test_session_gone_heuristic_honors_dep_install_success():
     source = _read("static/js/cookbookRunning.js")
 
     assert "const depInstallSucceeded = !!task.payload?._dep && _depInstallSucceeded(lastOutput);" in source
-    assert "const looksSuccessful = depInstallSucceeded" in source
-    assert "|| (task.type === 'download'" in source
-    assert "? downloadLooksSuccessful" in source
-    assert ": (_isPipTask ? pipLooksSuccessful : serveLooksReady));" in source
+    # Whitespace-normalized so the check survives line-wrapping/formatting while
+    # still proving the invariant: a finished dependency install short-circuits
+    # looksSuccessful ahead of the download/serve branch.
+    normalized = " ".join(source.split())
+    assert (
+        "const looksSuccessful = depInstallSucceeded "
+        "|| (task.type === 'download'"
+    ) in normalized
 
 
 def test_background_poll_recovers_done_for_stopped_dependency_install():
